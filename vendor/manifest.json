@@ -1,0 +1,12 @@
+{
+  "name": "@azure/msal-browser",
+  "version": "5.23.0",
+  "source": "https://registry.npmjs.org/@azure/msal-browser/-/msal-browser-5.23.0.tgz",
+  "integrity": "sha512-IRCwkRCK47hBXK+7bu67UZWY7HS0Jx1dZgi4C1HVbjlBum8Jy8fb2l87xFr6HxdQJWy951zRUHtwwDITHFAtaA==",
+  "files": [
+    "package/lib/msal-browser.min.js",
+    "package/lib/redirect-bridge/msal-redirect-bridge.js",
+    "package/LICENSE",
+    "package/package.json"
+  ]
+}
