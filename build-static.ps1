@@ -11,6 +11,7 @@ $files = @(
     'vendor\dompurify\dist\purify.es.mjs',
     'vendor\dompurify\LICENSE'
 )
+$files = $files | ForEach-Object { $_.Replace('\', [IO.Path]::DirectorySeparatorChar) }
 foreach ($file in $files) {
     if (!(Test-Path -LiteralPath (Join-Path $PSScriptRoot $file) -PathType Leaf)) {
         throw "Required deployment file is missing: $file. Run restore-sdk.ps1 if vendor files are missing."

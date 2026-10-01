@@ -59,12 +59,17 @@ are published. Tests, PowerShell scripts, README, Git data, and local caches are
 excluded. Packaging refuses unexpected files or filesystem links in `dist`
 instead of silently uploading them.
 
-The resource's existing GitHub workflow still tracks **master** and deploys that
-branch independently. The manual upload uses the current worktree, including
-uncommitted changes. A subsequent master-branch deployment can replace it.
-Before relying on CI for this version, integrate the application and adapt that
-workflow to run `build-static.ps1` and deploy `dist` with `skip_app_build: true`.
-This publication does not modify or retarget the existing workflow.
+The GitHub workflow deploys **master** automatically. It runs `build-static.ps1`
+and uploads only `dist`, with Azure's application/API builds disabled. Pull
+requests targeting master use Azure preview environments, which are closed when
+the pull request closes. The existing Azure deployment-token secret is reused.
+The packager supports both local Windows PowerShell and the workflow's Linux
+PowerShell runner; `/dist/` is ignored only at the repository root so vendored
+library files under their own `dist` directories remain versioned.
+
+Manual uploads use the current worktree, including uncommitted changes, and a
+subsequent master deployment replaces them. Commit and push to master when the
+published version should become the source for ongoing deployments.
 
 ### Add the production OAuth URLs
 
