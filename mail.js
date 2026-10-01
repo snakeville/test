@@ -1,3 +1,5 @@
+import { messagePreview } from './email-text.js';
+
 export const ACCOUNTS = [
   { id: 'gmail', name: 'Gmail', email: 'alex.morgan@example.com', color: 'coral', letter: 'G' },
   { id: 'outlook', name: 'Outlook', email: 'alex.morgan@outlook.example', color: 'blue', letter: 'O' },
@@ -8,17 +10,20 @@ export const isEmail = (value) => typeof value === 'string' && /^[^\s@]+@[^\s@]+
 export const findContact = (contacts, email) =>
   contacts.find((contact) => contact.emails.some((address) => normalizeEmail(address) === normalizeEmail(email)));
 
-export const conversationAddress = (message) => message.folder === 'sent' ? message.to : message.sender;
+export const isOutgoing = (message) => message.outgoing ?? (message.folder === 'sent' || message.folder === 'drafts' || message.folder === 'outbox');
+export const conversationAddress = (message) => isOutgoing(message) ? message.to : message.sender;
+export const providerFolderId = (accountId, remoteId) => `provider:${JSON.stringify([accountId, remoteId])}`;
 export const topicSubject = (subject) => subject.trim().replace(/^(?:re\s*:\s*)+/i, '').trim();
 export const conversationKey = (message) => JSON.stringify([
   message.accountId,
   message.remote ? 'provider-thread' : normalizeEmail(conversationAddress(message)),
   message.threadId ? ['thread', message.threadId] : ['subject', topicSubject(message.subject).toLowerCase() || message.id],
+  ...(message.isDraft ? ['draft', message.id] : []),
 ]);
 
 function matchesSearch(message, contacts, query) {
   const contact = findContact(contacts, conversationAddress(message));
-  return [message.subject, message.body, message.sender, message.senderName, contact?.name, message.to]
+  return [message.subject, message.body, messagePreview(message), message.sender, message.senderName, contact?.name, message.to]
     .filter(Boolean).some((value) => value.toLowerCase().includes(query));
 }
 
@@ -81,8 +86,9 @@ export function replyToConversation(state, messageId, body) {
 }
 
 const sampleContact = (id, name, emails, color, note, source) => ({ id, name, emails, color, note, source });
-const sampleMessage = (id, sender, senderName, accountId, subject, body, hour, unread = false, starred = false) => ({
+const sampleMessage = (id, sender, senderName, accountId, subject, body, hour, unread = false, starred = false, bodyHtml) => ({
   id, sender, senderName, accountId, subject, body,
+  ...(bodyHtml ? { bodyHtml } : {}),
   date: `2026-09-29T${hour}:00:00Z`, unread, starred, folder: 'inbox',
 });
 
@@ -107,7 +113,8 @@ export function createDemo() {
       sampleMessage('m4', 'james.w@example.com', 'James Wilson', 'gmail', 'Found that playlist I promised you',
         "Alex,\n\nRemember the record playing at dinner last week? I finally found the artist. I'll bring the album over next time.\n\nHope your week is treating you well!\nJames", '12'),
       sampleMessage('m5', 'sofia.m@example.com', 'Sofia Martinez', 'gmail', 'Something beautiful for your afternoon',
-        "Hi Alex,\n\nI walked past the new gallery today and thought of you. Their autumn exhibition is full of the landscape photography you love.\n\nWant to go next Thursday evening?\n\nSofia", '11', true, true),
+        "Hi Alex,\n\nI walked past the new gallery today and thought of you. Their autumn exhibition is full of the landscape photography you love.\n\nWant to go next Thursday evening?\n\nSofia", '11', true, true,
+        '<div style="color:#45643b"><h2>Something beautiful for your afternoon</h2><p>Hi Alex,</p><p>I walked past the <strong>new gallery</strong> today and thought of you. Their autumn exhibition is full of the <em>landscape photography</em> you love.</p><blockquote>Want to go next <strong>Thursday evening</strong>?</blockquote><p>Sofia</p></div>'),
       sampleMessage('m6', 'daniel.p@example.com', 'Daniel Park', 'outlook', 'A quick recap from this morning',
         "Hi Alex,\n\nThanks for the thoughtful conversation today. We agreed to keep the first release focused on the people who matter, rather than adding more notifications.\n\nI'll share the updated notes tomorrow. No action needed from you today.\n\nCheers,\nDaniel", '10'),
       sampleMessage('m7', 'emma.t@example.com', 'Emma Thompson', 'gmail', 'Sunday at ours',
@@ -136,7 +143,8 @@ export function visibleMessages(state, { folder = 'inbox', account = 'all', quer
       ? message.folder === 'inbox' && Boolean(contact)
       : folder === 'unknown'
         ? message.folder === 'inbox' && !contact
-        : folder === 'starred' ? message.starred : message.folder === folder;
+        : folder === 'starred' ? message.starred && !['spam', 'trash', 'drafts'].includes(message.folder)
+          : folder.startsWith('provider:') ? message.folderIds?.includes(folder) : message.folder === folder;
     return matchesFolder && (account === 'all' || message.accountId === account)
       && (!unread || message.unread)
       && (!search || matchesSearch(message, state.contacts, search));
@@ -146,11 +154,11 @@ export function visibleMessages(state, { folder = 'inbox', account = 'all', quer
 export function groupMessages(messages, contacts) {
   const groups = new Map();
   for (const message of messages) {
-    const email = message.folder === 'sent' ? message.to : message.sender;
+    const email = conversationAddress(message);
     const contact = findContact(contacts, email);
     const key = contact?.id || normalizeEmail(email);
     if (!groups.has(key)) groups.set(key, {
-      key, contact, name: contact?.name || (message.folder === 'sent' ? message.to : message.senderName),
+      key, contact, name: contact?.name || (isOutgoing(message) ? message.to : message.senderName),
       email, messages: [],
     });
     groups.get(key).messages.push(message);
@@ -224,6 +232,7 @@ export function isValidState(state) {
       && Array.isArray(contact.emails) && contact.emails.length > 0 && contact.emails.every(isEmail))
     && state.messages.every((message) => message
       && ['id', 'senderName', 'subject', 'body'].every((field) => text(message[field]))
+      && (message.bodyHtml === undefined || text(message.bodyHtml))
       && isEmail(message.sender) && ACCOUNTS.some((account) => account.id === message.accountId)
       && ['inbox', 'archive', 'sent'].includes(message.folder)
       && (message.folder !== 'sent' || isEmail(message.to))

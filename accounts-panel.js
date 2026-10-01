@@ -1,6 +1,8 @@
 import { openMailboxStore, isValidSnapshot } from './mailbox-store.js';
 import { importMailbox, combineSnapshots, PROVIDERS } from './provider-mail.js';
-import { prepareSignIn, getAccountApi, forgetSession, hasSession, validateClientId } from './auth.js';
+import { prepareSignIn, getAccountApi, forgetSession, hasSession, canSend, sendingToken, validateClientId } from './auth.js';
+import { prepareOutgoing, submitOutgoing, acceptedOutgoing, mergeLocalSends } from './email-send.js';
+import { conversationMessages } from './mail.js';
 
 const SETTINGS_KEY = 'gather-oauth-public-client-ids-v1';
 const escape = (value) => String(value).replace(/[&<>"']/g, (character) =>
@@ -47,8 +49,8 @@ export function createAccountsPanel({ onChange, onStatus }) {
 
   function renderAccounts() {
     list.innerHTML = snapshots.length ? snapshots.map((snapshot) => `<article class="connected-account">
-      <div><strong>${escape(snapshot.account.email)}</strong><span>${PROVIDERS[snapshot.account.provider].name} · ${hasSession(snapshot.account.id) ? 'Authorized in this tab' : 'Reconnect to sync'}</span>
-      <small>${snapshot.messages.length} messages · ${snapshot.contacts.length} contacts<br>Mail since ${escape(new Date(snapshot.since).toLocaleDateString())}<br>Last synced ${escape(new Date(snapshot.lastSync).toLocaleString())}</small></div>
+      <div><strong>${escape(snapshot.account.email)}</strong><span>${PROVIDERS[snapshot.account.provider].name} · ${hasSession(snapshot.account.id) ? canSend(snapshot.account.id) ? 'Sync and sending authorized' : 'Read-only · Reconnect to enable sending' : 'Reconnect to sync or send'}</span>
+      <small>${snapshot.messages.length} messages · ${snapshot.contacts.length} contacts · ${snapshot.folders?.length || 0} folders/labels<br>Mail since ${escape(new Date(snapshot.since).toLocaleDateString())}<br>Last synced ${escape(new Date(snapshot.lastSync).toLocaleString())}</small></div>
       <div class="connection-actions"><button type="button" class="text-button" data-reconnect="${escape(snapshot.account.id)}" ${busy ? 'disabled' : ''}>Reconnect</button>
       <button type="button" class="text-button" data-remove-account="${escape(snapshot.account.id)}" ${busy ? 'disabled' : ''}>Remove local data</button></div>
     </article>`).join('') : '<p class="muted">No real accounts imported yet. Demo data is stored separately.</p>';
@@ -113,16 +115,24 @@ export function createAccountsPanel({ onChange, onStatus }) {
   });
 
   async function saveImported(account, days) {
-    const previous = snapshots.find((snapshot) => snapshot.account.id === account.id);
-    const snapshot = await importMailbox({
-      account, previous, days, api: getAccountApi(account, controller.signal),
-      signal: controller.signal, progress: (message) => status(message),
+    const run = async () => {
+      const previous = snapshots.find((snapshot) => snapshot.account.id === account.id);
+      const snapshot = await importMailbox({
+        account, previous, days, api: getAccountApi(account, controller.signal, (message) => status(message)),
+        signal: controller.signal, progress: (message) => status(message),
+      });
+      controller.signal.throwIfAborted();
+      mergeLocalSends(snapshot, previous);
+      await store.save(snapshot);
+      snapshots = [...snapshots.filter((entry) => entry.account.id !== account.id), snapshot];
+      publish();
+      return snapshot;
+    };
+    if (!navigator.locks) return run();
+    return navigator.locks.request(`gather-mail-sync:${account.id}`, { ifAvailable: true }, (lock) => {
+      if (!lock) throw new Error('This account is already syncing in another Gather tab. Wait for it to finish or cancel sync in that tab.');
+      return run();
     });
-    controller.signal.throwIfAborted();
-    await store.save(snapshot);
-    snapshots = [...snapshots.filter((entry) => entry.account.id !== account.id), snapshot];
-    publish();
-    return snapshot;
   }
 
   connectButton.addEventListener('click', async () => {
@@ -133,7 +143,7 @@ export function createAccountsPanel({ onChange, onStatus }) {
     try {
       const account = await authorize(controller.signal, expectedId);
       const snapshot = await saveImported(account, Number(daysField.value));
-      status(`Imported ${snapshot.messages.length} messages and ${snapshot.contacts.length} contacts. Open Real mail to read them.`);
+      status(`Imported ${snapshot.messages.length} messages, ${snapshot.contacts.length} contacts, and ${snapshot.folders.length} folders/labels. Open Real mail to read them.`);
       configure();
     } catch (error) {
       status(controller.signal.aborted ? 'Import cancelled. The previous cache is unchanged.' : error.message, !controller.signal.aborted);
@@ -207,15 +217,95 @@ export function createAccountsPanel({ onChange, onStatus }) {
       }
       if (controller.signal.aborted) status('Sync cancelled. Completed accounts were saved; unfinished accounts keep their previous cache.');
       else if (failures.length) status(`${completed} account(s) synced. ${failures.join(' ')}`, true);
-      else status(`Synced ${completed} account(s). Real mail is read-only; nothing was changed at the provider.`);
+      else status(`Synced ${completed} account(s). Sync did not change mail at the provider.`);
     } finally {
       setBusy(false);
       controller = null;
     }
   }
 
+  async function send(accountId, values) {
+    if (busy) throw new Error('Wait for the current sync or send to finish before sending.');
+    setBusy(true);
+    try {
+      if (!store) store = await openMailboxStore();
+      const run = async () => {
+        // Read again while holding the account lock so another tab's sends are not overwritten.
+        snapshots = await store.list();
+        const snapshot = snapshots.find((entry) => entry.account.id === accountId);
+        if (!snapshot) throw new Error('Connect and sync this account before sending.');
+        const getToken = sendingToken(snapshot.account);
+        let parent = null;
+        if (values.replyToId) {
+          parent = snapshot.messages.find((message) => message.id === values.replyToId && !message.sendState);
+          if (!parent || !conversationMessages({ messages: snapshot.messages }, parent.id).length) throw new Error('Sync this conversation before replying.');
+        }
+        let message = prepareOutgoing(snapshot, { ...values, parent });
+        let updated = { ...snapshot, messages: [...snapshot.messages, message] };
+        await store.save(updated);
+        const publishAttempt = () => {
+          snapshots = [...snapshots.filter((entry) => entry.account.id !== accountId), updated];
+          publish();
+        };
+        publishAttempt();
+        status('Sending real email. Do not close this tab or submit it again.');
+        let result;
+        try {
+          result = await submitOutgoing(snapshot.account, message, parent, getToken);
+        } catch (error) {
+          message = { ...message, sendState: error.uncertain ? 'unknown' : 'failed', sendError: error.message };
+          updated = { ...snapshot, messages: [...snapshot.messages, message] };
+          let saveError = '';
+          try { await store.save(updated); } catch { saveError = ' The send status could not be saved locally; check Sent at the provider before retrying.'; }
+          publishAttempt();
+          status(error.message + saveError, true);
+          throw new Error(error.message + saveError);
+        }
+        message = acceptedOutgoing(snapshot, message, result);
+        updated = { ...snapshot, messages: [...snapshot.messages, message] };
+        let warning = '';
+        try { await store.save(updated); }
+        catch { warning = 'The provider accepted this email, but its sent status could not be saved locally. Do not resend; sync to recover it.'; }
+        publishAttempt();
+        status(warning || 'Email accepted by the provider. Delivery is not guaranteed; sync will confirm its Sent copy.', Boolean(warning));
+        return { message, warning };
+      };
+      if (!navigator.locks) return await run();
+      return await navigator.locks.request(`gather-mail-sync:${accountId}`, { ifAvailable: true }, async (lock) => {
+        if (!lock) throw new Error('This account is busy in another Gather tab. Wait before sending.');
+        return run();
+      });
+    } finally { setBusy(false); }
+  }
+
+  async function removeSendAttempt(accountId, messageId) {
+    if (busy) throw new Error('Wait for the current sync or send to finish.');
+    setBusy(true);
+    try {
+      const run = async () => {
+        if (!store) store = await openMailboxStore();
+        snapshots = await store.list();
+        const snapshot = snapshots.find((entry) => entry.account.id === accountId);
+        const attempt = snapshot?.messages.find((message) => message.id === messageId);
+        if (!attempt || !['sending', 'unknown', 'failed'].includes(attempt.sendState)) {
+          throw new Error('This is not an unconfirmed local send attempt. Sync to refresh its status.');
+        }
+        const updated = { ...snapshot, messages: snapshot.messages.filter((message) => message.id !== messageId) };
+        await store.save(updated);
+        snapshots = snapshots.map((entry) => entry.account.id === accountId ? updated : entry);
+        publish();
+        status('Local send attempt removed after your confirmation. No provider email was changed or recalled.');
+      };
+      if (!navigator.locks) return await run();
+      return await navigator.locks.request(`gather-mail-sync:${accountId}`, { ifAvailable: true }, (lock) => {
+        if (!lock) throw new Error('This account is busy in another Gather tab.');
+        return run();
+      });
+    } finally { setBusy(false); }
+  }
+
   return {
-    show, initialize, sync, isBusy: () => busy,
+    show, initialize, sync, send, removeSendAttempt, isBusy: () => busy,
     cancel,
     async syncWhenDue() {
       if (busy || document.hidden || Date.now() - lastAutomaticAttempt < 5 * 60000) return;

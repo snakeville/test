@@ -1,4 +1,6 @@
-import { isEmail, normalizeEmail } from './mail.js';
+import { isEmail, normalizeEmail, providerFolderId } from './mail.js';
+import { plainTextFromHtml } from './email-text.js';
+export { plainTextFromHtml } from './email-text.js';
 
 export const PROVIDERS = {
   gmail: { name: 'Gmail', color: 'coral', letter: 'G' },
@@ -8,6 +10,18 @@ const GMAIL = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const PEOPLE = 'https://people.googleapis.com/v1/people/me/connections';
 const GRAPH = 'https://graph.microsoft.com/v1.0';
 const DAY = 86400000;
+const BODY_FORMAT = 3;
+const FOLDER_FORMAT = 1;
+const GRAPH_SYSTEM_FOLDERS = {
+  inbox: 'inbox', sentitems: 'sent', archive: 'archive', drafts: 'drafts',
+  junkemail: 'spam', deleteditems: 'trash', outbox: 'outbox',
+};
+const GMAIL_SYSTEM_NAMES = {
+  INBOX: 'Inbox', SENT: 'Sent', DRAFT: 'Drafts', SPAM: 'Spam', TRASH: 'Trash',
+  STARRED: 'Starred', IMPORTANT: 'Important', UNREAD: 'Unread', CHAT: 'Chats',
+  CATEGORY_PERSONAL: 'Personal', CATEGORY_SOCIAL: 'Social', CATEGORY_PROMOTIONS: 'Promotions',
+  CATEGORY_UPDATES: 'Updates', CATEGORY_FORUMS: 'Forums',
+};
 
 export class ProviderError extends Error {
   constructor(message, status = 0) {
@@ -26,7 +40,72 @@ function pause(milliseconds, signal) {
   });
 }
 
-export function createApi(getToken, provider, signal, fetcher = fetch) {
+let gmailRequestQueue = Promise.resolve();
+let nextGmailRequestAt = 0;
+
+async function paceGmailRequest(signal) {
+  const previous = gmailRequestQueue;
+  let release;
+  gmailRequestQueue = new Promise((resolve) => { release = resolve; });
+  try {
+    await previous;
+    signal?.throwIfAborted();
+    const delay = Math.max(0, nextGmailRequestAt - Date.now());
+    if (delay) await pause(delay, signal);
+    nextGmailRequestAt = Date.now() + 200;
+  } finally { release(); }
+}
+
+function apiContext(target) {
+  if (target.hostname === 'people.googleapis.com') return 'Google People API (contacts sync)';
+  if (target.hostname === 'gmail.googleapis.com') {
+    const operation = target.pathname.endsWith('/profile') ? 'account lookup'
+      : target.pathname.endsWith('/labels') ? 'folder/label discovery'
+        : target.pathname.endsWith('/history') ? 'incremental mail sync'
+          : target.pathname.includes('/attachments/') ? 'embedded image download' : 'mail import';
+    return `Gmail API (${operation})`;
+  }
+  return 'Microsoft Graph';
+}
+
+async function errorReasons(response, signal) {
+  let body;
+  try { body = await response.json(); }
+  catch (error) {
+    signal?.throwIfAborted();
+    // Some proxies return HTML or an empty body. Keep the HTTP failure actionable.
+    if (error instanceof SyntaxError || error instanceof TypeError) return [];
+    throw error;
+  }
+  const error = body?.error;
+  return [
+    ...(Array.isArray(error?.details) ? error.details.map((detail) => detail?.reason) : []),
+    ...(Array.isArray(error?.errors) ? error.errors.map((detail) => detail?.reason) : []),
+    error?.status, error?.code,
+  ].filter((reason) => typeof reason === 'string');
+}
+
+function googleForbidden(target, reasons) {
+  const has = (...codes) => codes.some((code) => reasons.includes(code));
+  const people = target.hostname === 'people.googleapis.com';
+  const service = people ? 'People API' : 'Gmail API';
+  if (has('SERVICE_DISABLED', 'accessNotConfigured', 'serviceDisabled')) {
+    return `${service} is disabled or has not been enabled in the Google Cloud project that owns your OAuth client ID. Open Google Cloud Console > APIs & Services > Library, select that project, and enable ${service}. Wait a few minutes, then retry Sync. [SERVICE_DISABLED]`;
+  }
+  if (has('ACCESS_TOKEN_SCOPE_INSUFFICIENT', 'insufficientPermissions')) {
+    const scope = people ? 'https://www.googleapis.com/auth/contacts.readonly' : 'https://www.googleapis.com/auth/gmail.readonly';
+    return `The access token lacks the required permission (${scope}). In Accounts, Reconnect Google and grant both mail and contacts permissions. If consent is not offered, remove Gather's access in your Google account settings and reconnect. [ACCESS_TOKEN_SCOPE_INSUFFICIENT]`;
+  }
+  if (has('domainPolicy', 'ORG_RESTRICTION_VIOLATION', 'ORG_POLICY_VIOLATION')) {
+    return 'Your Google Workspace organization blocks this app or API. Ask your administrator to allow the OAuth app and Gmail/contacts access. Reconnecting alone will not change this policy. [domainPolicy]';
+  }
+  if (has('dailyLimitExceeded', 'dailyLimitExceededUnreg', 'quotaExceeded', 'QUOTA_EXCEEDED')) {
+    return `${service} quota has been exhausted. Check APIs & Services > ${service} > Quotas in the project that owns the OAuth client ID, or wait for the quota to reset. Changing permissions will not fix a quota error. [QUOTA_EXCEEDED]`;
+  }
+  return `Access was denied (HTTP 403). ${service} did not provide a recognized reason. Check that ${service} is enabled in the project owning your OAuth client ID, then Reconnect and grant both read-only mail and contacts permissions. A Workspace administrator may also restrict access.`;
+}
+
+export function createApi(getToken, provider, signal, fetcher = fetch, { onWait = () => {}, wait = pause } = {}) {
   const origins = provider === 'gmail'
     ? ['https://gmail.googleapis.com', 'https://people.googleapis.com']
     : ['https://graph.microsoft.com'];
@@ -35,8 +114,10 @@ export function createApi(getToken, provider, signal, fetcher = fetch) {
     if (!origins.includes(target.origin) || target.username || target.password) {
       throw new ProviderError('The provider returned an unsafe pagination URL. Sync stopped.');
     }
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const context = apiContext(target);
+    for (let attempt = 0; attempt < 5; attempt++) {
       signal?.throwIfAborted();
+      if (target.hostname === 'gmail.googleapis.com') await paceGmailRequest(signal);
       const token = await getToken();
       let response;
       try {
@@ -48,33 +129,34 @@ export function createApi(getToken, provider, signal, fetcher = fetch) {
         if (signal?.aborted) throw error;
         throw new ProviderError('Cannot reach the email provider. Check your connection, browser policy, and try Sync again.');
       }
-      if ([429, 503].includes(response.status) && attempt < 2) {
+      const reasons = !response.ok ? await errorReasons(response, signal) : [];
+      const googleRateLimit = provider === 'gmail' && response.status === 403
+        && reasons.some((reason) => ['rateLimitExceeded', 'userRateLimitExceeded', 'RATE_LIMIT_EXCEEDED'].includes(reason))
+        && !reasons.some((reason) => ['dailyLimitExceeded', 'quotaExceeded', 'QUOTA_EXCEEDED', 'SERVICE_DISABLED', 'accessNotConfigured', 'insufficientPermissions', 'ACCESS_TOKEN_SCOPE_INSUFFICIENT', 'domainPolicy'].includes(reason));
+      const retryable = [429, 503].includes(response.status) || googleRateLimit;
+      const retryLimit = provider === 'gmail' ? 4 : 2;
+      if (retryable && attempt < retryLimit) {
         const retry = response.headers.get('Retry-After');
         const seconds = retry && /^\d+$/.test(retry) ? Number(retry) : (Date.parse(retry) - Date.now()) / 1000;
-        if (seconds > 30) throw new ProviderError(`The provider requested a ${Math.ceil(seconds)} second pause. Try Sync again later.`, response.status);
-        await pause(Math.min(30000, Math.max(1000 * 2 ** attempt, Number.isFinite(seconds) ? seconds * 1000 : 0)), signal);
+        const maxWait = provider === 'gmail' ? 120000 : 30000;
+        if (seconds * 1000 > maxWait) throw new ProviderError(`${context}: the provider requested a ${Math.ceil(seconds)} second pause. Try Sync again later.`, response.status);
+        const delay = Math.min(maxWait, Math.max((provider === 'gmail' ? 5000 : 1000) * 2 ** attempt, Number.isFinite(seconds) ? seconds * 1000 : 0));
+        onWait(`${context}: ${googleRateLimit || response.status === 429 ? 'rate-limited' : 'temporarily unavailable'}. Waiting ${Math.ceil(delay / 1000)} seconds before retry ${attempt + 1} of ${retryLimit}. You can cancel sync.`);
+        await wait(delay, signal);
         continue;
       }
       if (!response.ok) {
         const reason = response.status === 401 ? 'Authorization expired. Reconnect this account.'
-          : response.status === 403 ? 'Access was denied. Check that mail and contacts permissions are granted and the APIs are enabled.'
+          : googleRateLimit ? 'Google is rate-limiting requests. Retried with backoff but the limit persists. Wait and try Sync again; changing permissions will not fix this. [RATE_LIMIT_EXCEEDED]'
+            : response.status === 403 ? provider === 'gmail' ? googleForbidden(target, reasons)
+              : 'Access was denied. Check that mail and contacts permissions are granted and the APIs are enabled.'
             : [429, 503].includes(response.status) ? 'The provider is busy or rate-limiting requests. Try Sync again later.'
               : `The provider returned HTTP ${response.status}. The previous cache has been preserved.`;
-        throw new ProviderError(reason, response.status);
+        throw new ProviderError(`${context}: ${reason}`, response.status);
       }
       return response.json();
     }
   };
-}
-
-export function plainTextFromHtml(html) {
-  const template = document.createElement('template');
-  // Template contents stay inert: images, scripts, frames, and links are never loaded.
-  template.innerHTML = html;
-  template.content.querySelectorAll('script,style,iframe,object,embed,svg,math,head,link,meta,form').forEach((node) => node.remove());
-  template.content.querySelectorAll('br').forEach((node) => node.replaceWith('\n'));
-  template.content.querySelectorAll('p,div,li,tr,h1,h2,h3,blockquote').forEach((node) => node.append('\n'));
-  return template.content.textContent.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function decodeBody(data, mime = '') {
@@ -99,10 +181,11 @@ function addresses(value) {
 export function gmailMessage(raw, account, since) {
   const labels = raw.labelIds || [];
   const milliseconds = Number(raw.internalDate);
-  if (labels.some((label) => ['TRASH', 'SPAM', 'DRAFT'].includes(label)) || milliseconds < Date.parse(since)) return null;
+  if (milliseconds < Date.parse(since)) return null;
   if (!raw.id || !raw.threadId || !Number.isFinite(milliseconds)) throw new ProviderError('Gmail returned incomplete message metadata.');
   const senderHeader = header(raw.payload, 'From');
-  const sender = addresses(senderHeader)[0];
+  const isDraft = labels.includes('DRAFT');
+  const sender = addresses(senderHeader)[0] || (isDraft ? account.email : null);
   if (!sender) throw new ProviderError('A Gmail message has no usable sender address. Import stopped without replacing the cache.');
   const toAddresses = addresses(header(raw.payload, 'To'));
   const sent = labels.includes('SENT');
@@ -126,32 +209,50 @@ export function gmailMessage(raw, account, since) {
   return {
     id: `${account.id}:${raw.id}`, remoteId: raw.id, remote: true, accountId: account.id, threadId: raw.threadId,
     sender, senderName: senderHeader.replace(/<[^>]*>/g, '').replace(/^"|"$/g, '').trim() || sender,
+    outgoing: sent || isDraft || sender === account.email, isDraft,
+    folderIds: labels.map((id) => providerFolderId(account.id, id)),
+    recipientMissing: isDraft && !toAddresses.length,
     to, participants: [...new Set([sender, ...toAddresses, ...addresses(header(raw.payload, 'Cc'))])],
-    subject: header(raw.payload, 'Subject'), body, date: new Date(milliseconds).toISOString(),
-    folder: sent ? 'sent' : labels.includes('INBOX') ? 'inbox' : 'archive',
+    toRecipients: toAddresses, ccRecipients: addresses(header(raw.payload, 'Cc')), replyTo: addresses(header(raw.payload, 'Reply-To')),
+    clientSendId: header(raw.payload, 'X-Gather-Send-ID'), references: header(raw.payload, 'References'),
+    subject: header(raw.payload, 'Subject'), body, ...(html.length ? { bodyHtml: html.join('\n\n') } : {}),
+    date: new Date(milliseconds).toISOString(),
+    folder: labels.includes('TRASH') ? 'trash' : labels.includes('SPAM') ? 'spam' : isDraft ? 'drafts'
+      : sent ? 'sent' : labels.includes('INBOX') ? 'inbox' : 'archive',
     unread: labels.includes('UNREAD'), starred: labels.includes('STARRED'),
     internetMessageId: header(raw.payload, 'Message-ID'), inReplyTo: header(raw.payload, 'In-Reply-To'),
   };
 }
 
-export function graphMessage(raw, account, folder, since) {
-  if (raw.isDraft) return null;
-  const date = raw.receivedDateTime || raw.sentDateTime;
+export function graphMessage(raw, account, folder, since, folderId = raw.parentFolderId) {
+  const isDraft = Boolean(raw.isDraft);
+  const date = isDraft || folder === 'outbox' ? raw.lastModifiedDateTime || raw.createdDateTime || raw.receivedDateTime
+    : raw.receivedDateTime || raw.sentDateTime || raw.createdDateTime;
   if (Date.parse(date) < Date.parse(since)) return null;
-  const sender = raw.from?.emailAddress?.address || raw.sender?.emailAddress?.address;
-  if (!raw.id || !raw.conversationId || !isEmail(sender) || !Number.isFinite(Date.parse(date))) {
+  const sender = raw.from?.emailAddress?.address || raw.sender?.emailAddress?.address || (isDraft ? account.email : null);
+  if (!raw.id || (!raw.conversationId && !isDraft) || !isEmail(sender) || !Number.isFinite(Date.parse(date))) {
     throw new ProviderError('Outlook returned incomplete message metadata. Import stopped without replacing the cache.');
   }
   const recipients = (raw.toRecipients || []).map((entry) => entry.emailAddress?.address).filter(isEmail).map(normalizeEmail);
   const to = recipients.find((email) => email !== account.email) || recipients[0] || account.email;
   return {
-    id: `${account.id}:${raw.id}`, remoteId: raw.id, remote: true, accountId: account.id, threadId: raw.conversationId,
+    id: `${account.id}:${raw.id}`, remoteId: raw.id, remote: true, accountId: account.id, threadId: raw.conversationId || `draft:${raw.id}`,
+    folderIds: folderId ? [providerFolderId(account.id, folderId)] : [],
+    providerParentId: raw.parentFolderId || folderId || '',
+    outgoing: isDraft || folder === 'sent' || folder === 'outbox' || normalizeEmail(sender) === account.email,
+    isDraft, recipientMissing: isDraft && !recipients.length,
     sender: normalizeEmail(sender), senderName: raw.from?.emailAddress?.name || sender, to,
+    toRecipients: recipients,
+    ccRecipients: (raw.ccRecipients || []).map((entry) => entry.emailAddress?.address).filter(isEmail).map(normalizeEmail),
+    replyTo: (raw.replyTo || []).map((entry) => entry.emailAddress?.address).filter(isEmail).map(normalizeEmail),
+    clientSendId: raw.internetMessageHeaders?.find((entry) => entry.name.toLowerCase() === 'x-gather-send-id')?.value || '',
     participants: [...new Set([normalizeEmail(sender), ...recipients,
       ...(raw.ccRecipients || []).map((entry) => entry.emailAddress?.address).filter(isEmail).map(normalizeEmail)])],
     subject: raw.subject || '', body: raw.body?.contentType?.toLowerCase() === 'html'
       ? plainTextFromHtml(raw.body.content || '') : raw.body?.content || '[No displayable text body.]',
-    date: new Date(date).toISOString(), folder, unread: !raw.isRead, starred: raw.flag?.flagStatus === 'flagged',
+    ...(raw.body?.contentType?.toLowerCase() === 'html' && raw.body.content ? { bodyHtml: raw.body.content } : {}),
+    date: new Date(date).toISOString(), folder: isDraft && !['spam', 'trash'].includes(folder) ? 'drafts' : folder,
+    unread: !raw.isRead, starred: raw.flag?.flagStatus === 'flagged',
     internetMessageId: raw.internetMessageId || '',
   };
 }
@@ -182,6 +283,7 @@ export function combineSnapshots(snapshots) {
   }
   return {
     version: 1, contacts, messages: snapshots.flatMap((snapshot) => snapshot.messages),
+    folders: snapshots.flatMap((snapshot) => snapshot.folders || []),
     accounts: snapshots.map((snapshot) => ({ ...PROVIDERS[snapshot.account.provider], ...snapshot.account })),
     lastSync: snapshots.length ? snapshots.map((snapshot) => snapshot.lastSync).sort()[0] : null,
   };
@@ -199,6 +301,68 @@ async function pages(api, initialUrl, field, onPage, signal, headers = {}) {
     await onPage(page[field], page);
     url = page['@odata.nextLink'] || null;
   }
+}
+
+export async function discoverFolders(account, api, signal) {
+  if (account.provider === 'gmail') {
+    const response = await api(`${GMAIL}/labels`);
+    if (!Array.isArray(response.labels)) throw new ProviderError('Gmail returned an invalid label catalog.');
+    const folders = response.labels.map((label) => {
+      if (typeof label.id !== 'string' || !label.id || typeof label.name !== 'string') throw new ProviderError('Gmail returned incomplete label metadata.');
+      return { id: providerFolderId(account.id, label.id), remoteId: label.id, accountId: account.id,
+        name: label.type === 'system' ? GMAIL_SYSTEM_NAMES[label.id] || label.name : label.name,
+        parentId: null, kind: 'label', hidden: label.labelListVisibility === 'labelHide',
+        path: label.type === 'system' ? GMAIL_SYSTEM_NAMES[label.id] || label.name : label.name };
+    });
+    if (new Set(folders.map((folder) => folder.id)).size !== folders.length) throw new ProviderError('Gmail repeated a label in its catalog. Sync stopped.');
+    for (const folder of folders) {
+      const parent = folder.path.includes('/') ? folders.find((entry) => entry.path === folder.path.slice(0, folder.path.lastIndexOf('/'))) : null;
+      if (parent && parent !== folder) { folder.parentId = parent.id; folder.name = folder.path.slice(parent.path.length + 1); }
+    }
+    return folders;
+  }
+  const fields = 'id,displayName,parentFolderId,childFolderCount,isHidden';
+  const folders = [];
+  const ids = new Set();
+  const queue = [{ url: `${GRAPH}/me/mailFolders?includeHiddenFolders=true&$select=${fields}&$top=100`, parent: null }];
+  for (let index = 0; index < queue.length; index++) {
+    const { url, parent } = queue[index];
+    await pages(api, url, 'value', (items) => {
+      for (const item of items) {
+        if (typeof item.id !== 'string' || !item.id || typeof item.displayName !== 'string' || !Number.isInteger(item.childFolderCount)
+          || item.childFolderCount < 0) throw new ProviderError('Outlook returned incomplete folder metadata.');
+        if (ids.has(item.id)) throw new ProviderError('Outlook repeated a folder in its hierarchy. Sync stopped.');
+        ids.add(item.id);
+        const folder = {
+          id: providerFolderId(account.id, item.id), remoteId: item.id, accountId: account.id,
+          name: item.displayName, path: parent ? `${parent.path}/${item.displayName}` : item.displayName,
+          parentId: parent?.id || null, kind: 'other', hidden: Boolean(item.isHidden),
+          search: item['@odata.type'] === '#microsoft.graph.mailSearchFolder',
+        };
+        folders.push(folder);
+        if (item.childFolderCount) queue.push({
+          url: `${GRAPH}/me/mailFolders/${encodeURIComponent(item.id)}/childFolders?includeHiddenFolders=true&$select=${fields}&$top=100`,
+          parent: folder,
+        });
+      }
+    }, signal);
+  }
+  for (const [wellKnown, kind] of Object.entries(GRAPH_SYSTEM_FOLDERS)) {
+    signal?.throwIfAborted();
+    try {
+      const item = await api(`${GRAPH}/me/mailFolders/${wellKnown}?$select=id`);
+      const folder = folders.find((entry) => entry.remoteId === item.id);
+      if (folder) folder.kind = kind;
+    } catch (error) {
+      if (error.status !== 404) throw error;
+    }
+  }
+  // Descendants of Junk/Deleted stay out of normal aggregated views.
+  for (const folder of folders) {
+    const parent = folders.find((entry) => entry.id === folder.parentId);
+    if (parent && ['spam', 'trash'].includes(parent.kind)) folder.kind = parent.kind;
+  }
+  return folders;
 }
 
 export async function identifyAccount(provider, api, clientId) {
@@ -220,12 +384,16 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
   const current = await identifyAccount(account.provider, api, account.clientId);
   if (current.id !== account.id) throw new ProviderError('A different account was authorized. Reconnect the correct account; the cache has not changed.');
   const contacts = [];
+  progress('Discovering all provider folders and labels...');
+  const folders = await discoverFolders(account, api, signal);
   let messages;
-  let cursors = {};
-  const full = !previous || previous.days !== days;
+  let cursors = Object.create(null);
+  const full = !previous || previous.days !== days || previous.bodyFormat !== BODY_FORMAT || previous.folderFormat !== FOLDER_FORMAT;
+  if (previous && previous.bodyFormat !== BODY_FORMAT) progress('Refreshing cached mail to include original HTML and reply metadata...');
+  if (previous && previous.folderFormat !== FOLDER_FORMAT) progress('Expanding the cache to all folders, including drafts, spam, and deleted mail...');
   if (account.provider === 'gmail') {
     const profile = await api(`${GMAIL}/profile`);
-    messages = new Map(full ? [] : previous.messages.map((message) => [message.remoteId, message]));
+    messages = new Map(full ? [] : previous.messages.filter((message) => !message.sendState).map((message) => [message.remoteId, { ...message }]));
     let historyId = full ? null : previous.cursors?.historyId;
     const changed = new Set();
     if (historyId) {
@@ -257,11 +425,11 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
       messages = new Map();
       let pageToken = '';
       const seen = new Set();
-      const q = `after:${Math.floor(Date.parse(since) / 1000)} -in:trash -in:spam -in:drafts`;
+      const q = `after:${Math.floor(Date.parse(since) / 1000)}`;
       do {
         if (seen.has(pageToken)) throw new ProviderError('Gmail repeated a mail page. Sync stopped.');
         seen.add(pageToken);
-        const page = await api(`${GMAIL}/messages?maxResults=100&q=${encodeURIComponent(q)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`);
+        const page = await api(`${GMAIL}/messages?maxResults=100&includeSpamTrash=true&q=${encodeURIComponent(q)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`);
         (page.messages || []).forEach((message) => changed.add(message.id));
         pageToken = page.nextPageToken || '';
         progress(`Found ${changed.size} Gmail messages...`);
@@ -277,6 +445,8 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
       if (normalized) messages.set(id, normalized); else messages.delete(id);
       progress(`Gmail: read ${++count} of ${changed.size} changed messages`);
     }
+    const folderIds = new Set(folders.map((folder) => folder.id));
+    for (const message of messages.values()) message.folderIds = message.folderIds.filter((id) => folderIds.has(id));
     let pageToken = '';
     const seen = new Set();
     do {
@@ -293,15 +463,30 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
     } while (pageToken);
   } else {
     messages = new Map();
-    const fields = 'id,conversationId,subject,body,from,sender,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,isDraft,flag,internetMessageId';
-    const headers = { Prefer: 'outlook.body-content-type="text", IdType="ImmutableId"' };
-    for (const [remoteFolder, folder] of [['inbox', 'inbox'], ['sentitems', 'sent'], ['archive', 'archive']]) {
-      const initial = `${GRAPH}/me/mailFolders/${remoteFolder}/messages/delta?$select=${fields}&$filter=${encodeURIComponent(`receivedDateTime ge ${since}`)}&$top=100`;
+    const fields = 'id,parentFolderId,conversationId,subject,body,from,sender,toRecipients,ccRecipients,replyTo,internetMessageHeaders,receivedDateTime,sentDateTime,createdDateTime,lastModifiedDateTime,isRead,isDraft,flag,internetMessageId';
+    const headers = { Prefer: 'outlook.body-content-type="html", IdType="ImmutableId"' };
+    const folderByRemoteId = new Map(folders.map((folder) => [folder.remoteId, folder]));
+    for (const currentFolder of folders) {
+      signal?.throwIfAborted();
+      const remoteFolder = currentFolder.remoteId;
+      const folder = currentFolder.kind;
+      const folderUrl = `${GRAPH}/me/mailFolders/${encodeURIComponent(remoteFolder)}/messages`;
+      const unfiltered = ['drafts', 'outbox'].includes(folder);
+      const initial = `${folderUrl}/delta?$select=${fields}&$filter=${encodeURIComponent(`receivedDateTime ge ${since}`)}&$top=100`;
       const previousCursor = !full && previous.cursors?.[remoteFolder];
-      const fullRefresh = previousCursor === 'full';
+      const fullRefresh = previousCursor === 'full' || unfiltered || currentFolder.search;
       const saved = !fullRefresh && previousCursor;
-      let entries = new Map(saved ? previous.messages.filter((message) => message.folder === folder).map((message) => [message.remoteId, message]) : []);
+      let entries = new Map(saved ? previous.messages.filter((message) => !message.sendState && message.folderIds.includes(currentFolder.id))
+        .map((message) => {
+          const currentKind = folderByRemoteId.get(message.providerParentId)?.kind || folder;
+          return [message.remoteId, { ...message,
+            folder: message.isDraft && !['spam', 'trash'].includes(currentKind) ? 'drafts' : currentKind,
+            folderIds: [currentFolder.id],
+          }];
+        }) : []);
       let deltaCount = 0;
+      const normalize = (item) => graphMessage(item, account,
+        folderByRemoteId.get(item.parentFolderId)?.kind || folder, since, remoteFolder);
       const consume = async (url) => pages(api, url, 'value', async (items, page) => {
         deltaCount += items.length;
         for (const item of items) {
@@ -315,24 +500,25 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
               continue;
             }
           }
-          const message = graphMessage(complete, account, folder, since);
+          const message = normalize(complete);
           if (message) entries.set(item.id, message); else entries.delete(item.id);
         }
         if (page['@odata.deltaLink']) cursors[remoteFolder] = page['@odata.deltaLink'];
         if (!page['@odata.deltaLink'] && !page['@odata.nextLink']) {
           throw new ProviderError('Outlook returned no continuation or sync cursor. The previous cache was preserved.');
         }
-        progress(`Outlook ${remoteFolder}: ${entries.size} messages`);
+        progress(`Outlook ${currentFolder.path}: ${entries.size} messages`);
       }, signal, headers);
       const refreshFolder = async () => {
-        progress(`Outlook ${remoteFolder}: using full pagination to avoid the 5,000-message filtered delta limit...`);
+        progress(`Outlook ${currentFolder.path}: refreshing folder contents with full pagination...`);
         entries = new Map();
-        await pages(api, initial.replace('/messages/delta?', '/messages?'), 'value', (items) => {
+        const listUrl = unfiltered ? `${folderUrl}?$select=${fields}&$top=100` : initial.replace('/messages/delta?', '/messages?');
+        await pages(api, listUrl, 'value', (items) => {
           for (const item of items) {
-            const message = graphMessage(item, account, folder, since);
+            const message = normalize(item);
             if (message) entries.set(item.id, message);
           }
-          progress(`Outlook ${remoteFolder}: refreshed ${entries.size} messages`);
+          progress(`Outlook ${currentFolder.path}: refreshed ${entries.size} messages`);
         }, signal, headers);
         cursors[remoteFolder] = 'full';
       };
@@ -342,15 +528,18 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
       }
       catch (error) {
         if (saved && [404, 410].includes(error.status)) {
-          progress(`Outlook ${remoteFolder} sync cursor expired. Rebuilding that folder...`);
+          progress(`Outlook ${currentFolder.path} sync cursor expired. Rebuilding that folder...`);
           entries = new Map();
+          deltaCount = 0;
           await consume(initial);
-        } else if (remoteFolder === 'archive' && error.status === 404 && !saved) {
-          progress('This Outlook mailbox has no Archive folder.');
         } else throw error;
       }
       if (!fullRefresh && (entries.size >= 5000 || deltaCount >= 5000)) await refreshFolder();
-      for (const [id, message] of entries) messages.set(id, message);
+      for (const [id, message] of entries) {
+        const existing = messages.get(id);
+        const latest = existing && existing.date > message.date ? existing : message;
+        messages.set(id, { ...latest, folderIds: [...new Set([...(existing?.folderIds || []), currentFolder.id])] });
+      }
     }
     await pages(api, `${GRAPH}/me/contacts?$select=id,displayName,emailAddresses&$top=100`, 'value', (items) => {
       for (const item of items) {
@@ -361,5 +550,6 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
     }, signal);
   }
   signal?.throwIfAborted();
-  return { account, messages: [...messages.values()], contacts, cursors, days, since, lastSync: new Date().toISOString(), version: 1 };
+  return { account, messages: [...messages.values()], contacts, folders, cursors, days, since,
+    lastSync: new Date().toISOString(), version: 1, bodyFormat: BODY_FORMAT, folderFormat: FOLDER_FORMAT };
 }

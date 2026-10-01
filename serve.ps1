@@ -2,13 +2,24 @@ param([int]$Port = 5173)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $listener = [System.Net.HttpListener]::new()
-$listener.Prefixes.Add("http://127.0.0.1:$Port/")
+$listener.Prefixes.Add("http://localhost:$Port/")
 $files = @{
     '/' = @('index.html', 'text/html')
     '/index.html' = @('index.html', 'text/html')
     '/styles.css' = @('styles.css', 'text/css')
     '/app.js' = @('app.js', 'text/javascript')
     '/mail.js' = @('mail.js', 'text/javascript')
+    '/email-html.js' = @('email-html.js', 'text/javascript')
+    '/email-images.js' = @('email-images.js', 'text/javascript')
+    '/email-text.js' = @('email-text.js', 'text/javascript')
+    '/email-quotes.js' = @('email-quotes.js', 'text/javascript')
+    '/email-send.js' = @('email-send.js', 'text/javascript')
+    '/send-tests.html' = @('send-tests.html', 'text/html')
+    '/send.test.js' = @('send.test.js', 'text/javascript')
+    '/email-styles.js' = @('email-styles.js', 'text/javascript')
+    '/vendor/dompurify/dist/purify.es.mjs' = @('vendor\dompurify\dist\purify.es.mjs', 'text/javascript')
+    '/html-tests.html' = @('html-tests.html', 'text/html')
+    '/html.test.js' = @('html.test.js', 'text/javascript')
     '/tests.html' = @('tests.html', 'text/html')
     '/mail.test.js' = @('mail.test.js', 'text/javascript')
     '/ui-tests.html' = @('ui-tests.html', 'text/html')
@@ -26,7 +37,7 @@ $files = @{
 }
 try {
     $listener.Start()
-    Write-Host "Gather is running at http://127.0.0.1:$Port (Ctrl+C to stop)"
+    Write-Host "Gather is running at http://localhost:$Port (Ctrl+C to stop)"
     while ($listener.IsListening) {
         $context = $listener.GetContext()
         $response = $context.Response

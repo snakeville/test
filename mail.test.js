@@ -1,4 +1,6 @@
 import { createDemo, findContact, visibleMessages, visibleConversations, conversationMessages, conversationKey, conversationAddress, topicSubject, replyToConversation, groupMessages, addContact, updateContact, syncDemo, isValidState, isEmail } from './mail.js';
+import { normalizePlainText, plainTextFromHtml, messagePlainText, messagePreview } from './email-text.js';
+import { stripQuotedHtml, stripQuotedText, messageQuoteContent } from './email-quotes.js';
 
 const results = [];
 function test(name, check) {
@@ -20,6 +22,94 @@ function throws(action) {
 
 test('Sample state validates and survives JSON serialization', () => {
   assert(isValidState(JSON.parse(JSON.stringify(createDemo()))));
+});
+test('Proton reply hides nested original history while preserving the latest reply and signature', () => {
+  const html = '<html><body style="color:blue">My latest reply.<br><div class="protonmail_signature_block-user">My signature</div><br>Sent from my phone.<div class="protonmail_quote"><br>-------- Original Message --------<br>On Friday, Person wrote:<blockquote class="protonmail_quote">Previous message<div class="gmail_quote">Older message</div></blockquote></div></body></html>';
+  const result = stripQuotedHtml(html);
+  assert(result.hasQuotes && result.html.includes('My latest reply.') && result.html.includes('My signature'));
+  assert(result.html.includes('Sent from my phone.') && result.html.includes('color:blue'));
+  assert(!result.html.includes('Previous message') && !result.html.includes('Older message') && !result.html.includes('Original Message'));
+  assert(html.includes('Previous message'));
+});
+test('Gmail, Yahoo, and cite quotations hide only marked content, preserving replies below them', () => {
+  for (const wrapper of ['<div class="gmail_quote">', '<div class="yahoo_quoted">', '<blockquote type="cite">']) {
+    const end = wrapper.startsWith('<blockquote') ? '</blockquote>' : '</div>';
+    const result = stripQuotedHtml(`<p>Before</p>${wrapper}Old email${end}<p>Reply below</p>`);
+    assert(result.hasQuotes && result.html.includes('Reply below') && !result.html.includes('Old email'));
+  }
+  const editorial = '<p>A useful quotation:</p><blockquote>Keep this quote.</blockquote><p>My explanation.</p>';
+  assert(stripQuotedHtml(editorial).html === editorial && !stripQuotedHtml(editorial).hasQuotes);
+});
+test('Outlook reply headers hide following history but retain the latest message', () => {
+  const result = stripQuotedHtml('<div>Latest reply</div><div><div id="divRplyFwdMsg">From: Someone</div><p>Prior message</p></div>');
+  assert(result.hasQuotes && result.html.includes('Latest reply') && !result.html.includes('Prior message'));
+});
+test('Plain-text original-message separators and Outlook headers collapse previous history', () => {
+  const result = stripQuotedText('New reply.\n\nSignature\n\n-------- Original Message --------\nOn Friday, Someone wrote:\n\n> Old content\n>> Older content');
+  assert(result.hasQuotes && result.text === 'New reply.\n\nSignature');
+  const outlook = stripQuotedText('New reply.\n\nFrom: person@example.com\nSent: Tuesday\nTo: me@example.com\nSubject: Topic\n\nOld content');
+  assert(outlook.hasQuotes && outlook.text === 'New reply.');
+  assert(!stripQuotedText('Notes:\nFrom: the beginning of the project\nThis is current content.').hasQuotes);
+});
+test('On-wrote and trailing quoted blocks preserve inline answers and fenced examples', () => {
+  const result = stripQuotedText('My answer.\n\nOn Tuesday, Someone\n<person@example.com> wrote:\n> Question one\n\nMy second answer.\n\n> More old text');
+  assert(result.hasQuotes && result.text === 'My answer.\n\nMy second answer.');
+  const code = 'Example:\n```\nOn Tuesday, Someone wrote:\n> literal quote\n```\nThis stays.';
+  assert(stripQuotedText(code).text === code);
+});
+test('Quote previews use the current reply and retain unmodified originals for expanded display and search', () => {
+  const message = { body: 'New reply\n\n> Old text', bodyHtml: '<p>New reply</p><div class="protonmail_quote">Old text</div>' };
+  const before = JSON.stringify(message);
+  assert(messageQuoteContent(message).hasQuotes);
+  assert(messagePlainText(message, { hideQuotes: true }) === 'New reply');
+  assert(messagePlainText(message).includes('Old text'));
+  assert(messagePreview(message) === 'New reply' && JSON.stringify(message) === before);
+  message.bodyHtml = '<p>No quote now</p>';
+  assert(!messageQuoteContent(message).hasQuotes);
+});
+test('Plain text trims extra spaces, blank padding, nonbreaking spaces, and Windows line endings', () => {
+  const text = '\r\n  Hello   Alex,\u00a0 \r\n \t\r\n\r\n\r\nHere\u00a0\u00a0is   the update.  \r\n\r\n';
+  assert(normalizePlainText(text) === 'Hello Alex,\n\nHere is the update.');
+  assert(normalizePlainText('\ufeffhel\u200blo   world') === 'hello world');
+  assert(normalizePlainText(' \n\t\n ') === '');
+});
+test('Plain text preserves line breaks, nested lists, indented code, and fenced-code spacing', () => {
+  const text = 'Hello,\nA short note.\n\n- First   item\n  - Nested   item\n\n    const x = "two  spaces";   \n\taligned\tcolumns\n\n```js\nconst y = "two  spaces";\n\n\nreturn y;\n```\n\nGood   bye.';
+  assert(normalizePlainText(text) === 'Hello,\nA short note.\n\n- First item\n  - Nested item\n\n    const x = "two  spaces";\n\taligned\tcolumns\n\n```js\nconst y = "two  spaces";\n\n\nreturn y;\n```\n\nGood bye.');
+});
+test('HTML text conversion ignores source indentation and keeps readable paragraph separation', () => {
+  const html = '\n    <div>\n      <p>Hello&nbsp;   <strong>Alex</strong>,</p>\n      <div>Here is <em>the update</em>.</div>\n    </div>\n';
+  assert(plainTextFromHtml(html) === 'Hello Alex,\n\nHere is the update.');
+  assert(plainTextFromHtml('<p>First<br>Second</p><p>Third</p>') === 'First\nSecond\n\nThird');
+  assert(plainTextFromHtml('<p>hel\u200blo</p>') === 'hello');
+});
+test('HTML lists, table cells, and preformatted code retain useful structure', () => {
+  assert(plainTextFromHtml('<ul><li>One</li><li>Two</li></ul>') === '- One\n- Two');
+  assert(plainTextFromHtml('<ol start="3"><li>Three</li><li>Four</li></ol>') === '3. Three\n4. Four');
+  assert(plainTextFromHtml('<table><tr><td>Name</td><td>Value</td></tr><tr><td>A</td><td>10</td></tr></table>') === 'Name\tValue\nA\t10');
+  const code = '  x  =  1;\n\n\n\treturn x;';
+  assert(plainTextFromHtml(`<p>Code:</p><pre>${code}</pre><p>End.</p>`) === `Code:\n\n${code}\n\nEnd.`);
+});
+test('HTML text conversion omits hidden preheaders and active content without fetching images', () => {
+  assert(plainTextFromHtml('<div style="display:none">Hidden</div><span hidden>Hidden</span><div style="visibility:hidden">Hidden</div><script>bad()</script><style>bad{}</style><p>Visible <img src="https://example.invalid/track">text</p>')
+    === 'Visible text');
+});
+test('Display normalization updates cached messages without mutating their stored original bodies', () => {
+  const message = { body: '  Old   text\r\n\r\n\r\n', bodyHtml: '<p>Fresh&nbsp;  HTML</p>' };
+  const before = JSON.stringify(message);
+  assert(messagePlainText(message) === 'Fresh HTML');
+  assert(JSON.stringify(message) === before);
+  message.bodyHtml = '<p>Changed   HTML</p>';
+  assert(messagePlainText(message) === 'Changed HTML');
+  delete message.bodyHtml;
+  assert(messagePlainText(message) === 'Old text');
+});
+test('Previews collapse whitespace and search matches the normalized displayed phrase', () => {
+  const message = { body: 'Hello   Alex\n\n    A longer line\twith columns' };
+  assert(messagePreview(message) === 'Hello Alex A longer line with columns');
+  const state = createDemo();
+  state.messages[0].body = 'An   unusually\u00a0\u00a0spaced   phrase.';
+  assert(visibleMessages(state, { query: 'unusually spaced phrase' }).length === 1);
 });
 test('Contact lookup normalizes case and surrounding whitespace', () => {
   assert(findContact(createDemo().contacts, '  MAYA.CHEN@EXAMPLE.COM ').id === 'maya');

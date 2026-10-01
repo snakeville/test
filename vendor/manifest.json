@@ -1,12 +1,29 @@
 {
-  "name": "@azure/msal-browser",
-  "version": "5.23.0",
-  "source": "https://registry.npmjs.org/@azure/msal-browser/-/msal-browser-5.23.0.tgz",
-  "integrity": "sha512-IRCwkRCK47hBXK+7bu67UZWY7HS0Jx1dZgi4C1HVbjlBum8Jy8fb2l87xFr6HxdQJWy951zRUHtwwDITHFAtaA==",
-  "files": [
-    "package/lib/msal-browser.min.js",
-    "package/lib/redirect-bridge/msal-redirect-bridge.js",
-    "package/LICENSE",
-    "package/package.json"
+  "packages": [
+    {
+      "name": "@azure/msal-browser",
+      "directory": "msal-browser",
+      "version": "5.23.0",
+      "source": "https://registry.npmjs.org/@azure/msal-browser/-/msal-browser-5.23.0.tgz",
+      "integrity": "sha512-IRCwkRCK47hBXK+7bu67UZWY7HS0Jx1dZgi4C1HVbjlBum8Jy8fb2l87xFr6HxdQJWy951zRUHtwwDITHFAtaA==",
+      "files": [
+        "package/lib/msal-browser.min.js",
+        "package/lib/redirect-bridge/msal-redirect-bridge.js",
+        "package/LICENSE",
+        "package/package.json"
+      ]
+    },
+    {
+      "name": "dompurify",
+      "directory": "dompurify",
+      "version": "3.4.16",
+      "source": "https://registry.npmjs.org/dompurify/-/dompurify-3.4.16.tgz",
+      "integrity": "sha512-sqo+pNp3qRhCIpbgRi1y8Tgk27Bo2Ry7w0dC1NBeNTdZChWjz9Xb/KOoZbRP/R6pQZ80Qw8YhXw13hWWBbMRnQ==",
+      "files": [
+        "package/dist/purify.es.mjs",
+        "package/LICENSE",
+        "package/package.json"
+      ]
+    }
   ]
 }

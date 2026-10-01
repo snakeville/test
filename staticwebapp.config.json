@@ -1,0 +1,24 @@
+{
+  "routes": [
+    {
+      "route": "/oauth-redirect.html",
+      "headers": {
+        "Cache-Control": "no-store",
+        "Cross-Origin-Opener-Policy": "",
+        "Content-Security-Policy": "default-src 'none'; script-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+      }
+    }
+  ],
+  "globalHeaders": {
+    "Cache-Control": "no-cache",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "frame-ancestors 'self'",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()"
+  },
+  "mimeTypes": {
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".css": "text/css"
+  }
+}

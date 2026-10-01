@@ -2,6 +2,7 @@ import { createApi, identifyAccount, ProviderError } from './provider-mail.js';
 
 const GOOGLE_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/contacts.readonly'];
 const MICROSOFT_SCOPES = ['User.Read', 'Mail.Read', 'Contacts.Read'];
+const GOOGLE_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
 const sessions = new Map();
 const libraries = new Map();
 
@@ -42,10 +43,22 @@ export function hasSession(accountId) {
   return Boolean(session && (!session.expiresAt || Date.now() < session.expiresAt));
 }
 
-export function getAccountApi(account, signal) {
+export function getAccountApi(account, signal, onWait) {
   const session = sessions.get(account.id);
   if (!hasSession(account.id)) throw new ProviderError('Reconnect this account to sync. Cached messages are still available.');
-  return createApi(session.getToken, account.provider, signal);
+  return createApi(session.getToken, account.provider, signal, fetch, { onWait });
+}
+
+export function canSend(accountId) {
+  return hasSession(accountId) && sessions.get(accountId).canSend === true;
+}
+
+export function sendingToken(account) {
+  if (!canSend(account.id)) throw new ProviderError('Reconnect this account and grant sending permission before sending real email.');
+  return () => {
+    if (!canSend(account.id)) throw new ProviderError('Authorization expired. Reconnect with sending permission.');
+    return sessions.get(account.id).getToken(true);
+  };
 }
 
 export async function forgetSession(id) {
@@ -62,7 +75,7 @@ export async function prepareSignIn(provider, inputId) {
     await loadScript('https://accounts.google.com/gsi/client', () => Boolean(window.google?.accounts?.oauth2));
     authorize = () => new Promise((resolve, reject) => {
       const client = google.accounts.oauth2.initTokenClient({
-        client_id: clientId, scope: GOOGLE_SCOPES.join(' '),
+        client_id: clientId, scope: [...GOOGLE_SCOPES, GOOGLE_SEND_SCOPE].join(' '),
         include_granted_scopes: false,
         callback: (response) => {
           if (response.error) { reject(new Error(`Google authorization failed (${response.error}).`)); return; }
@@ -75,7 +88,7 @@ export async function prepareSignIn(provider, inputId) {
             return;
           }
           const expires = Date.now() + Number(response.expires_in) * 1000 - 60000;
-          resolve({ expiresAt: expires, getToken: async () => {
+          resolve({ canSend: google.accounts.oauth2.hasGrantedAllScopes(response, GOOGLE_SEND_SCOPE), expiresAt: expires, getToken: async () => {
             if (Date.now() >= expires) throw new ProviderError('Gmail authorization expired. Reconnect Gmail to continue syncing.');
             return response.access_token;
           } });
@@ -97,10 +110,11 @@ export async function prepareSignIn(provider, inputId) {
       system: { loggerOptions: { piiLoggingEnabled: false, loggerCallback: () => {} } },
     });
     await instance.initialize();
-    authorize = () => instance.acquireTokenPopup({ scopes: MICROSOFT_SCOPES, prompt: 'select_account' }).then((result) => ({
-      getToken: async () => {
+    authorize = () => instance.acquireTokenPopup({ scopes: [...MICROSOFT_SCOPES, 'Mail.Send'], prompt: 'select_account' }).then((result) => ({
+      canSend: result.scopes?.some((scope) => scope.toLowerCase().replace('https://graph.microsoft.com/', '') === 'mail.send') === true,
+      getToken: async (forSending = false) => {
         try {
-          const token = await instance.acquireTokenSilent({ scopes: MICROSOFT_SCOPES, account: result.account });
+          const token = await instance.acquireTokenSilent({ scopes: forSending ? [...MICROSOFT_SCOPES, 'Mail.Send'] : MICROSOFT_SCOPES, account: result.account });
           return token.accessToken;
         } catch (error) {
           if (error instanceof msal.InteractionRequiredAuthError) throw new ProviderError('Microsoft needs authorization again. Reconnect this account.');
