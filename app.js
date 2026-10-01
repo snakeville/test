@@ -36,7 +36,7 @@ let selected = 'm1';
 let syncing = false;
 const collapsed = new Set();
 const replyDrafts = new Map();
-const plainTextMessages = new Set();
+const htmlConversations = new Set();
 const expandedQuotes = new Set();
 const imagePermissions = new Map();
 let disposeHtmlMessages = () => {};
@@ -57,7 +57,11 @@ const connections = createAccountsPanel({
   onChange: (updated) => {
     const previousSelection = state.messages.find((message) => message.id === selected);
     if (realMode && previousSelection?.clientSendId) {
-      selected = updated.messages.find((message) => message.clientSendId === previousSelection.clientSendId)?.id || selected;
+      const replacement = updated.messages.find((message) => message.clientSendId === previousSelection.clientSendId);
+      if (replacement && htmlConversations.has(conversationKey(previousSelection))) {
+        htmlConversations.add(conversationKey(replacement));
+      }
+      selected = replacement?.id || selected;
     }
     for (const id of expandedFolderAccounts) {
       if (!updated.accounts.some((entry) => entry.id === id)) expandedFolderAccounts.delete(id);
@@ -116,6 +120,48 @@ function notify(message) {
   notice.classList.add('visible');
   clearTimeout(noticeTimer);
   noticeTimer = setTimeout(() => notice.classList.remove('visible'), 4500);
+}
+
+function blockConversationImages(messages) {
+  for (const message of messages) {
+    imagePermissions.get(message.id)?.controller.abort();
+    imagePermissions.delete(message.id);
+  }
+}
+
+function confirmImages(scope) {
+  return confirm(`Load images for ${scope}?\n\nRemote image hosts may learn your IP address and that you opened this email. Your browser may also send their cookies. Embedded images may be fetched from your email provider.\n\nThis choice lasts only in this tab and is not saved.`);
+}
+
+async function enableImages(messages) {
+  const pending = [];
+  for (const message of messages) {
+    if (!message.bodyHtml || imagePermissions.has(message.id)) continue;
+    const references = inlineImageReferences(message.bodyHtml);
+    const permission = {
+      bodyHtml: message.bodyHtml, remote: Boolean(message.remote), images: new Map(),
+      controller: new AbortController(), status: references.size ? 'Loading embedded images...' : '', error: false,
+    };
+    imagePermissions.set(message.id, permission);
+    if (references.size) pending.push({ message, permission, references, from: accounts.find((entry) => entry.id === message.accountId) });
+  }
+  render();
+  for (const { message, permission, references, from } of pending) {
+    if (imagePermissions.get(message.id) !== permission || permission.controller.signal.aborted) continue;
+    try {
+      if (!message.remote) throw new Error('Embedded attachment images are not available in demo data.');
+      permission.images = await loadInlineImages(message, from, getAccountApi(from, permission.controller.signal), permission.controller.signal);
+      const missing = references.size - permission.images.size;
+      permission.status = missing ? `${missing} embedded image(s) unavailable, unsupported, or larger than 10 MB. Open the message at your provider to view them.` : '';
+      permission.error = missing > 0;
+    } catch (error) {
+      if (!permission.controller.signal.aborted) {
+        permission.status = `Embedded images could not load: ${error.message}`;
+        permission.error = true;
+      }
+    }
+    if (imagePermissions.get(message.id) === permission) render();
+  }
 }
 
 function persist() {
@@ -271,7 +317,7 @@ function chatMessage(message) {
       : message.folder === 'archive' ? 'Received · Archived' : 'Received';
   const locationNote = realMode && ['trash', 'spam'].includes(message.folder) ? ` · ${message.folder === 'trash' ? 'Deleted / Trash' : 'Junk / Spam'}` : '';
   const contact = findContact(state.contacts, message.sender);
-  const formatted = Boolean(message.bodyHtml) && !plainTextMessages.has(message.id);
+  const formatted = Boolean(message.bodyHtml) && htmlConversations.has(conversationKey(message));
   const quoteContent = messageQuoteContent(message);
   const showQuotes = expandedQuotes.has(message.id);
   const text = messagePlainText(message, { hideQuotes: !showQuotes });
@@ -279,8 +325,7 @@ function chatMessage(message) {
   const containsImages = /<img\b/i.test(message.bodyHtml || '');
   return `<li class="chat-message ${sent ? 'outgoing' : 'incoming'} ${formatted ? 'has-html' : ''}" data-chat-message="${escape(message.id)}">
     <div class="chat-meta"><strong>${sent ? 'You' : escape(contact?.name || message.senderName)}</strong><time datetime="${message.date}" title="${escape(new Date(message.date).toLocaleString())}">${time(message.date)}</time></div>
-    ${realMode ? `<div class="chat-addresses">From ${escape(message.sender)} · To ${message.recipientMissing ? 'No recipient yet' : escape(message.toRecipients?.length ? message.toRecipients.join(', ') : message.to)}${message.ccRecipients?.length ? ` · Cc ${escape(message.ccRecipients.join(', '))}` : ''}</div>` : ''}
-    ${message.bodyHtml ? `<div class="html-controls"><span>${formatted ? images ? 'HTML · Images enabled for this message' : 'HTML · Images blocked' : 'Plain-text view'}</span><div class="html-control-actions">${formatted && containsImages ? `<button class="text-button" data-action="${images ? 'hide-images' : 'load-images'}" data-item="${escape(message.id)}">${images ? 'Hide images' : 'Load images'}</button>` : ''}<button class="text-button" data-action="toggle-html" data-item="${escape(message.id)}">${formatted ? 'Show plain text' : 'Show HTML'}</button></div></div>` : ''}
+    ${formatted && containsImages ? `<div class="html-controls"><span>${images ? 'Images enabled for this message' : 'Images blocked'}</span><button class="text-button" data-action="${images ? 'hide-images' : 'load-images'}" data-item="${escape(message.id)}">${images ? 'Hide images' : 'Load images'}</button></div>` : ''}
     ${formatted && images?.status ? `<p class="image-status ${images.error ? 'form-error' : ''}" role="${images.error ? 'alert' : 'status'}">${escape(images.status)}</p>` : ''}
     <div class="chat-bubble">${formatted ? `<iframe class="html-message" data-html-message="${escape(message.id)}" title="Formatted email from ${escape(message.senderName)}" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe><div class="html-fallback" hidden><p role="status"></p><div class="message-body">${escape(text || (quoteContent.hasQuotes ? 'Quoted previous messages hidden.' : ''))}</div></div>` : `<div class="message-body">${escape(text || (quoteContent.hasQuotes ? 'Quoted previous messages hidden.' : ''))}</div>`}</div>
     ${quoteContent.hasQuotes ? `<button class="text-button quote-toggle" data-action="toggle-quotes" data-item="${escape(message.id)}" aria-expanded="${showQuotes}">${showQuotes ? 'Hide quoted text' : 'Show quoted text'}</button>` : ''}
@@ -325,7 +370,13 @@ function reader() {
       <span class="chat-total">${messages.length} message${messages.length === 1 ? '' : 's'} · ${realMode ? 'Imported history' : 'Full conversation'}</span>
     </div>
     <header class="chat-heading">
-      <div class="chat-person">${avatar(name, contact?.color || 'sand', 'large')}<div><strong>${escape(name)}</strong><span class="sender-address">${escape(address)}</span></div>${provider(from.id)}</div>
+      <div class="chat-person">
+        ${avatar(name, contact?.color || 'sand', 'large')}<div><strong>${escape(name)}</strong><span class="sender-address">${escape(address)}</span></div>${provider(from.id)}
+        <div class="conversation-format" role="group" aria-label="Conversation display format">
+          <button data-action="conversation-format" data-format="html" aria-pressed="${htmlConversations.has(key)}">HTML</button>
+          <button data-action="conversation-format" data-format="plain" aria-pressed="${!htmlConversations.has(key)}">Plain text</button>
+        </div>
+      </div>
       <h2 class="subject-heading" title="${escape(topicSubject(first.subject) || '(No subject)')}">${escape(topicSubject(first.subject) || '(No subject)')}</h2>
       ${participants.length > 1 ? `<p class="chat-addresses">Participants: ${participants.map(escape).join(', ')}</p>` : ''}
       ${!contact && received && !realMode ? `<div class="unknown-callout"><span>This sender isn't in your contacts yet.</span><button data-action="add-sender">${icon('plus')} Add contact</button></div>` : ''}
@@ -619,40 +670,36 @@ app.addEventListener('click', async (event) => {
         return;
       }
       case 'about': notify(realMode ? 'Mail is cached on this device. Sending requires your explicit permission; existing mail and contacts are not edited. No Gather backend is used.' : 'Demo accounts are fictional samples. Use Real mail to connect your own accounts.'); return;
-      case 'toggle-html':
-        if (plainTextMessages.has(message.id)) plainTextMessages.delete(message.id);
-        else plainTextMessages.add(message.id);
-        break;
+      case 'conversation-format': {
+        if (!message) return;
+        const key = conversationKey(message);
+        const messages = conversationMessages(state, message.id);
+        if (button.dataset.format === 'plain') {
+          htmlConversations.delete(key);
+          blockConversationImages(messages);
+        } else if (!htmlConversations.has(key)) {
+          htmlConversations.add(key);
+          blockConversationImages(messages);
+          const withImages = messages.filter((entry) => /<img\b/i.test(entry.bodyHtml || ''));
+          if (withImages.length && confirmImages('the messages in this conversation')) {
+            const loading = enableImages(withImages);
+            document.querySelector('.conversation-format [data-format="html"]')?.focus({ preventScroll: true });
+            await loading;
+            return;
+          }
+        }
+        render();
+        document.querySelector(`.conversation-format [data-format="${button.dataset.format === 'plain' ? 'plain' : 'html'}"]`)?.focus({ preventScroll: true });
+        return;
+      }
       case 'toggle-quotes':
         if (expandedQuotes.has(message.id)) expandedQuotes.delete(message.id);
         else expandedQuotes.add(message.id);
         break;
       case 'load-images': {
         if (!message?.bodyHtml || imagePermissions.has(message.id)) return;
-        if (!confirm('Load images for this message?\n\nRemote image hosts may learn your IP address and that you opened this email. Your browser may also send their cookies. Embedded images may be fetched from your email provider.\n\nThis choice lasts only in this tab and is not saved.')) return;
-        const references = inlineImageReferences(message.bodyHtml);
-        const permission = {
-          bodyHtml: message.bodyHtml, remote: Boolean(message.remote), images: new Map(),
-          controller: new AbortController(), status: references.size ? 'Loading embedded images...' : '', error: false,
-        };
-        imagePermissions.set(message.id, permission);
-        render();
-        if (references.size) {
-          try {
-            const from = accounts.find((entry) => entry.id === message.accountId);
-            if (!message.remote) throw new Error('Embedded attachment images are not available in demo data.');
-            permission.images = await loadInlineImages(message, from, getAccountApi(from, permission.controller.signal), permission.controller.signal);
-            const missing = references.size - permission.images.size;
-            permission.status = missing ? `${missing} embedded image(s) unavailable, unsupported, or larger than 10 MB. Open the message at your provider to view them.` : '';
-            permission.error = missing > 0;
-          } catch (error) {
-            if (!permission.controller.signal.aborted) {
-              permission.status = `Embedded images could not load: ${error.message}`;
-              permission.error = true;
-            }
-          }
-          if (imagePermissions.get(message.id) === permission) render();
-        }
+        if (!confirmImages('this message')) return;
+        await enableImages([message]);
         return;
       }
       case 'hide-images':
@@ -702,7 +749,7 @@ app.addEventListener('click', async (event) => {
         folder = 'inbox'; account = 'all'; selected = 'm1'; query = ''; unreadOnly = false;
         collapsed.clear();
         replyDrafts.clear();
-        plainTextMessages.clear();
+        htmlConversations.clear();
         expandedQuotes.clear();
         for (const permission of imagePermissions.values()) permission.controller.abort();
         imagePermissions.clear();

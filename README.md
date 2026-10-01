@@ -127,15 +127,25 @@ return 404 instead of the app page. The app's existing meta CSP remains active.
   and sanitized width-based responsive stylesheets in a sandboxed frame that
   expands to the full message height. Newsletter container widths, nested
   auto-width tables, image dimensions, rounded corners, and hidden preheaders
-  are retained rather than replaced with a uniform full-width layout. **Show
-  plain text / Show HTML** switches each message's view. Sofia's gallery message
+  are retained rather than replaced with a uniform full-width layout. The
+  **HTML / Plain text** switch in the conversation header changes every message
+  in that conversation together. Conversations default to **Plain text**.
+  Switching to HTML asks once whether to load images if any messages contain them;
+  declining still shows formatted HTML with images blocked. Messages without images
+  switch without a prompt. Text-only messages remain readable in either mode.
+  The format choice is remembered per conversation in the current tab, including
+  when switching folders, and resets to Plain text on reload. Message bubbles omit repeated
+  From/To/Cc address rows; participants remain in the header and reply recipients
+  remain explicit in the reply form and send confirmation. Sofia's gallery message
   in fresh demo data includes sample HTML formatting; resetting is not necessary
   for existing real accounts.
 - **Load images** enables images for one HTML message after a tracking/privacy
   warning. **Hide images** blocks them again and cancels pending embedded-image
   fetches; it cannot undo requests already sent. The choice is memory-only,
   applies only to the unchanged message in this tab, and clears on reload,
-  mailbox-mode changes, or account removal. There is no global always-load option.
+  returning to Plain text, mailbox-mode changes, or account removal. Approving
+  the conversation's HTML-switch prompt enables images only in its current messages;
+  future arrivals do not inherit that permission. There is no global always-load option.
 - Replies are written inline and saved to both the conversation and demo Sent
   without leaving the chat. The reply uses the conversation's account and exact
   correspondent address. Unsaved replies stay in memory while switching topics
@@ -483,7 +493,8 @@ not to resend; its persisted pre-send attempt prevents an automatic duplicate.
   viewport-dependent sizing, and embedded active content are stripped. Root body
   height is controlled by Gather to avoid clipping or resize feedback.
   Proprietary Outlook/Word markup, VML, and unsupported CSS can still look different
-  from Outlook. Plain text is available per message, and search/previews use it.
+  from Outlook. Plain text is available for the whole conversation, and
+  search/previews use the text bodies.
 - After **Load images**, ordinary HTTP(S) image URLs load directly in the message
   frame with no referrer and no Google/Microsoft bearer token. The image host can
   still observe the viewer's IP address, timing, and any identifiers in the URL;

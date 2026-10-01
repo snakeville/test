@@ -81,6 +81,12 @@ try {
     if (!element) throw new Error(`Missing ${selector}`);
     element.click();
   };
+  const chooseFormat = (format, allowImages = false) => {
+    const previousConfirm = windowInFrame.confirm;
+    windowInFrame.confirm = () => allowImages;
+    click(`[data-action="conversation-format"][data-format="${format}"]`);
+    windowInFrame.confirm = previousConfirm;
+  };
   click('[data-action="real-mode"]');
   await waitFor(() => documentInFrame.querySelector('.real-status'));
   assert(!documentInFrame.querySelector('.message-card'), 'Real mode starts empty rather than displaying demo mail');
@@ -179,11 +185,11 @@ try {
         ] },
       }));
       const sent = url.pathname.endsWith('/real-2');
-      const body = btoa(sent ? 'An actual sent message, imported.' : `<h2>Provider HTML</h2><p>A private <strong>imported</strong> message.</p><a href="https://example.test/message">Read more</a><img src="${imageData}" alt="Embedded data image"><img src="cid:logo" alt="Provider image"><div class="protonmail_quote">-------- Original Message --------<blockquote>Earlier quoted content<div class="gmail_quote">Oldest quoted content</div></blockquote></div>`);
+      const body = btoa(sent ? `<p>An actual <em>sent</em> message, imported.</p><img src="${imageData}" alt="Sent image">` : `<h2>Provider HTML</h2><p>A private <strong>imported</strong> message.</p><a href="https://example.test/message">Read more</a><img src="${imageData}" alt="Embedded data image"><img src="cid:logo" alt="Provider image"><div class="protonmail_quote">-------- Original Message --------<blockquote>Earlier quoted content<div class="gmail_quote">Oldest quoted content</div></blockquote></div>`);
       return new Response(JSON.stringify({
         id: sent ? 'real-2' : 'real-1', threadId: 'actual-thread',
         labelIds: sent ? ['SENT'] : ['INBOX', 'UNREAD', 'projects', 'nested'], internalDate: String(Date.now() - (sent ? 1000 : 2000)),
-        payload: { mimeType: sent ? 'text/plain' : 'text/html', body: { data: body }, parts: sent ? [] : [
+        payload: { mimeType: 'text/html', body: { data: body }, parts: sent ? [] : [
           { mimeType: 'image/png', headers: [{ name: 'Content-ID', value: '<logo>' }], body: { attachmentId: 'image1', size: 1000 }, filename: 'logo.png' },
         ], headers: [
           { name: 'From', value: sent ? 'real-user@example.com' : 'Maya <maya@example.com>' },
@@ -259,7 +265,7 @@ try {
   folderButton('Drafts').click();
   click('.message-card');
   assert(documentInFrame.querySelector('.chat-message-footer').textContent.includes('Draft · Not sent'), 'Draft is explicitly marked not sent');
-  assert(documentInFrame.querySelector('.chat-addresses').textContent.includes('No recipient yet'), 'Recipient-less drafts remain readable');
+  assert(documentInFrame.querySelector('.chat-person').textContent.includes('Draft without recipient'), 'Recipient-less drafts remain readable');
   assert(!documentInFrame.querySelector('#chat-reply-form'), 'Draft view cannot send or modify provider drafts');
   click('[data-action="back"]');
   folderButton('Spam').click();
@@ -272,20 +278,43 @@ try {
   assert(documentInFrame.querySelectorAll('.message-card').length === 1, 'Imported inbox groups received and sent mail by provider thread');
   click('.message-card');
   assert(bubbles() === 2, 'Real conversation displays imported received and sent messages');
+  assert(!documentInFrame.querySelector('.html-message')
+    && documentInFrame.querySelector('[data-format="plain"]').getAttribute('aria-pressed') === 'true',
+    'Conversations open as plain text by default, without mounting HTML or requesting images');
+  let formatPrompts = [];
+  const initialConfirm = windowInFrame.confirm;
+  const requestsBeforeHtml = requests.length;
+  windowInFrame.confirm = message => { formatPrompts.push(message); return false; };
+  click('[data-action="conversation-format"][data-format="html"]');
+  windowInFrame.confirm = initialConfirm;
+  assert(formatPrompts.length === 1 && formatPrompts[0].includes('this conversation') && formatPrompts[0].includes('IP address'),
+    'Switching a multi-message conversation to HTML asks once about loading its images');
+  assert(requests.length === requestsBeforeHtml, 'Declining the conversation image prompt makes no provider image requests');
   await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.querySelector('strong')
     && documentInFrame.querySelector('.html-message').style.height);
   let htmlFrame = documentInFrame.querySelector('.html-message');
   assert(htmlFrame.contentDocument.querySelector('strong').textContent === 'imported', 'Imported HTML renders formatting inside an isolated frame');
+  assert(documentInFrame.querySelectorAll('.conversation-format').length === 1
+    && documentInFrame.querySelector('.chat-heading .conversation-format'), 'One display-format switch appears in the conversation header');
+  assert(documentInFrame.querySelectorAll('.html-message').length === 2, 'HTML mode renders both received and sent HTML messages');
+  assert(documentInFrame.querySelector('[data-format="html"]').getAttribute('aria-pressed') === 'true',
+    'Declining images still switches the conversation to HTML');
+  assert(!documentInFrame.querySelector('.chat-message .chat-addresses'), 'Message bubbles omit repeated From, To, and Cc address lines');
   assert(!htmlFrame.contentDocument.body.textContent.includes('Earlier quoted content'), 'Conversation hides nested reply history by default');
   assert(documentInFrame.querySelector('[data-action="toggle-quotes"]').getAttribute('aria-expanded') === 'false', 'Quoted-history control starts collapsed');
   click('[data-action="toggle-quotes"]');
   await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.body?.textContent.includes('Oldest quoted content'));
   assert(documentInFrame.querySelector('[data-action="toggle-quotes"]').textContent === 'Hide quoted text', 'Quote control restores the complete nested history');
-  click('[data-action="toggle-html"]');
+  chooseFormat('plain');
+  assert(!documentInFrame.querySelector('.html-message')
+    && documentInFrame.querySelectorAll('.chat-message .message-body').length === 2,
+    'Conversation Plain text selection changes every HTML message together');
+  assert(documentInFrame.querySelector('[data-format="plain"]').getAttribute('aria-pressed') === 'true',
+    'Conversation format exposes its selected state accessibly');
   assert(documentInFrame.querySelector('.incoming .message-body').textContent.includes('Earlier quoted content'), 'Expanded history remains visible when switching to plain text');
   click('[data-action="toggle-quotes"]');
   assert(!documentInFrame.querySelector('.incoming .message-body').textContent.includes('Earlier quoted content'), 'Collapsing hides history in plain-text mode');
-  click('[data-action="toggle-html"]');
+  chooseFormat('html');
   await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.querySelector('strong'));
   htmlFrame = documentInFrame.querySelector('.html-message');
   assert(!htmlFrame.contentDocument.body.textContent.includes('Earlier quoted content'), 'Collapsed history stays hidden after switching back to HTML');
@@ -346,12 +375,44 @@ try {
   await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.body?.textContent.includes('Image blocked'));
   assert(!documentInFrame.querySelector('[data-action="hide-images"]'), 'Switching mailboxes clears per-message image permission');
   windowInFrame.confirm = originalConfirm;
-  click('[data-action="toggle-html"]');
+  chooseFormat('plain');
   assert(!documentInFrame.querySelector('.html-message') && documentInFrame.querySelector('.incoming .message-body').textContent.includes('A private imported message.'),
     'Plain-text toggle shows the searchable fallback without HTML');
-  click('[data-action="toggle-html"]');
+  click('[data-action="back"]');
+  folderButton('Drafts').click();
+  click('.message-card');
+  assert(documentInFrame.querySelector('[data-format="plain"]').getAttribute('aria-pressed') === 'true',
+    'Other conversations retain their default plain-text format');
+  click('[data-action="back"]');
+  click('[data-folder="inbox"]');
+  click('.message-card');
+  assert(!documentInFrame.querySelector('.html-message')
+    && documentInFrame.querySelector('[data-format="plain"]').getAttribute('aria-pressed') === 'true',
+    'Plain-text conversation preference survives folder and conversation navigation');
+  chooseFormat('html');
   await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.querySelector('strong'));
   assert(documentInFrame.querySelector('.html-message'), 'HTML toggle restores the formatted view');
+  chooseFormat('plain');
+  const countBeforeApprove = requests.length;
+  chooseFormat('html', true);
+  await waitFor(() => [...documentInFrame.querySelectorAll('.html-message')].length === 2
+    && [...documentInFrame.querySelectorAll('.html-message')].every(iframe => {
+      const images = [...(iframe.contentDocument?.querySelectorAll('img') || [])];
+      return images.length && images.every(image => image.naturalWidth === 120);
+    }));
+  assert(documentInFrame.querySelectorAll('[data-action="hide-images"]').length === 2 && requests.length > countBeforeApprove,
+    'Approving the conversation prompt enables images for all its current image-containing messages');
+  formatPrompts = [];
+  windowInFrame.confirm = message => { formatPrompts.push(message); return true; };
+  click('[data-action="conversation-format"][data-format="html"]');
+  windowInFrame.confirm = initialConfirm;
+  assert(formatPrompts.length === 0, 'Clicking the already-selected HTML mode does not ask again');
+  chooseFormat('plain');
+  assert(!documentInFrame.querySelector('.html-message'), 'Returning to plain text removes image-bearing HTML frames');
+  chooseFormat('html');
+  await waitFor(() => [...documentInFrame.querySelectorAll('.html-message')].every(iframe => iframe.contentDocument?.body?.textContent.includes('Image blocked')));
+  assert(!documentInFrame.querySelector('[data-action="hide-images"]'),
+    'Switching back to HTML and declining does not reuse old image permissions');
   assert(documentInFrame.querySelector('#chat-reply-form [type="submit"]').textContent.includes('Send reply'),
     'Authorized real conversations expose Send reply, not demo Save reply');
   assert(!documentInFrame.querySelector('[data-action="archive"]') && !documentInFrame.querySelector('[data-action="star"]'), 'Real conversation has no mutation controls');
@@ -464,6 +525,9 @@ try {
     && !documentInFrame.querySelector('#chat-reply-form [type="submit"]').disabled);
   assert(bubbles() === countBeforeSending + 1 && documentInFrame.querySelector('#chat-reply').value === '',
     'Accepted real reply appears immediately in the same conversation and clears the draft');
+  assert(documentInFrame.querySelectorAll('.html-message').length === 2
+    && documentInFrame.querySelector('.chat-message:last-child .message-body').textContent === 'A real reply from Gather.',
+    'HTML conversation mode preserves readability of newly sent plain-text messages');
   assert(documentInFrame.querySelector('[data-folder="inbox"]').getAttribute('aria-current') === 'page',
     'Real reply does not navigate away from inbox');
   assert(sentCopies[0].threadId === 'actual-thread', 'Real reply sends the existing provider thread ID');
@@ -522,6 +586,11 @@ try {
   assert(documentInFrame.querySelectorAll('.message-card').length === 7, 'Switching back restores the demo inbox');
   assert(JSON.stringify(saved()) === demoBefore, 'Connection, failed sync, cancellation, and removal leave demo data unchanged');
   click('[data-message="m5"]');
+  formatPrompts = [];
+  windowInFrame.confirm = message => { formatPrompts.push(message); return false; };
+  click('[data-action="conversation-format"][data-format="html"]');
+  windowInFrame.confirm = initialConfirm;
+  assert(formatPrompts.length === 0, 'HTML messages without images switch formats without an image prompt');
   await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.querySelector('blockquote'));
   assert(documentInFrame.querySelector('.html-message').contentDocument.querySelector('em').textContent === 'landscape photography',
     'Fresh demo data includes a formatted HTML conversation');
