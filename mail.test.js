@@ -23,6 +23,33 @@ function throws(action) {
 test('Sample state validates and survives JSON serialization', () => {
   assert(isValidState(JSON.parse(JSON.stringify(createDemo()))));
 });
+test('Sender tabs partition the selected account and folder without changing legacy inbox behavior', () => {
+  const state = createDemo();
+  const options = { folder: 'inbox', account: 'gmail' };
+  const known = visibleConversations(state, { ...options, audience: 'contacts' });
+  const unknown = visibleConversations(state, { ...options, audience: 'unknown' });
+  assert(known.length === 5 && unknown.length === 2);
+  assert(known.every(thread => thread.accountId === 'gmail') && unknown.every(thread => thread.accountId === 'gmail'));
+  assert(!known.some(thread => unknown.some(other => thread.key === other.key)));
+  assert(visibleMessages(state).length === 7);
+});
+test('Sender tabs classify sent conversations by recipient and apply search inside that tab', () => {
+  const state = createDemo();
+  state.messages.push({ ...state.messages.find(message => message.folder === 'sent'), id: 'unknown-sent', to: 'new@example.com', subject: 'Unknown recipient' });
+  assert(visibleConversations(state, { folder: 'sent', audience: 'contacts' }).length === 1);
+  assert(visibleConversations(state, { folder: 'sent', audience: 'unknown', query: 'recipient' }).length === 1);
+  assert(visibleConversations(state, { folder: 'sent', audience: 'contacts', query: 'Unknown recipient' }).length === 0);
+});
+test('Sender tabs preserve provider folder membership and full thread history', () => {
+  const state = createDemo();
+  state.messages[0].folderIds = ['provider:custom'];
+  state.messages.find(message => message.id === 'u1').folderIds = ['provider:custom'];
+  const options = { folder: 'provider:custom', account: 'gmail' };
+  const known = visibleConversations(state, { ...options, audience: 'contacts' });
+  const unknown = visibleConversations(state, { ...options, audience: 'unknown' });
+  assert(known.length === 1 && known[0].messages.length === 2);
+  assert(unknown.length === 1 && unknown[0].id === 'u1');
+});
 test('Proton reply hides nested original history while preserving the latest reply and signature', () => {
   const html = '<html><body style="color:blue">My latest reply.<br><div class="protonmail_signature_block-user">My signature</div><br>Sent from my phone.<div class="protonmail_quote"><br>-------- Original Message --------<br>On Friday, Person wrote:<blockquote class="protonmail_quote">Previous message<div class="gmail_quote">Older message</div></blockquote></div></body></html>';
   const result = stripQuotedHtml(html);

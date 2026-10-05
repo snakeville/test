@@ -29,24 +29,28 @@ try {
 }
 
 let folder = 'inbox';
-let account = 'all';
+let account = DEMO_ACCOUNTS[0].id;
 let query = '';
 let unreadOnly = false;
-let selected = 'm1';
+let selected = null;
+let audience = 'contacts';
+let folderChosen = false;
 let syncing = false;
-const collapsed = new Set();
+const expandedGroups = new Set();
 const replyDrafts = new Map();
 const htmlConversations = new Set();
+const conversationSearches = new Map();
+const mobileLayout = window.matchMedia('(max-width: 900px)');
 const expandedQuotes = new Set();
 const imagePermissions = new Map();
 let disposeHtmlMessages = () => {};
 let noticeTimer;
 let realMode = false;
+let homeVisible = true;
 let accounts = DEMO_ACCOUNTS;
 let demoState = state;
 let realState = { version: 1, accounts: [], contacts: [], messages: [], folders: [], lastSync: null };
 let providerFoldersOpen = true;
-const expandedFolderAccounts = new Set();
 const expandedFolderBranches = new Set();
 let realStatus = '';
 let realError = false;
@@ -61,10 +65,10 @@ const connections = createAccountsPanel({
       if (replacement && htmlConversations.has(conversationKey(previousSelection))) {
         htmlConversations.add(conversationKey(replacement));
       }
+      if (replacement && conversationSearches.has(conversationKey(previousSelection))) {
+        conversationSearches.set(conversationKey(replacement), conversationSearches.get(conversationKey(previousSelection)));
+      }
       selected = replacement?.id || selected;
-    }
-    for (const id of expandedFolderAccounts) {
-      if (!updated.accounts.some((entry) => entry.id === id)) expandedFolderAccounts.delete(id);
     }
     for (const id of expandedFolderBranches) {
       if (!updated.folders.some((entry) => entry.id === id)) expandedFolderBranches.delete(id);
@@ -174,17 +178,6 @@ function persist() {
   }
 }
 
-function count(view) {
-  return visibleConversations(state, { folder: view, account }).length;
-}
-
-function navItem(id, glyph, nested = false) {
-  const amount = id === 'contacts' ? state.contacts.length : count(id);
-  return `<button class="nav-item ${folder === id ? 'active' : ''} ${nested ? 'nested' : ''}" data-folder="${id}" ${folder === id ? 'aria-current="page"' : ''}>
-    ${icon(glyph)}<span>${labels[id]}</span>${amount ? `<span class="nav-count">${amount}</span>` : ''}
-  </button>`;
-}
-
 function currentFolder() {
   return state.folders?.find((entry) => entry.id === folder);
 }
@@ -193,14 +186,83 @@ function folderLabel() {
   return currentFolder()?.path || labels[folder] || 'Folder';
 }
 
+function groupExpansionKey(key) {
+  return JSON.stringify([realMode, account, folder, audience, key]);
+}
+
+function selectFolder(id) {
+  folder = id; folderChosen = true; selected = null; query = ''; unreadOnly = false;
+}
+
+function resetAccountView() {
+  folder = state.folders?.find((entry) => entry.accountId === account && (entry.kind === 'inbox' || entry.remoteId === 'INBOX'))?.id || 'inbox';
+  folderChosen = false; selected = null; query = ''; unreadOnly = false; audience = 'contacts';
+}
+
+async function switchMode(nextRealMode) {
+  if (syncing || sending) {
+    notify('Wait for the current sync or send to finish before switching mailboxes.');
+    render();
+    return;
+  }
+  if (!realMode) demoState = state;
+  homeVisible = false;
+  realMode = nextRealMode;
+  state = realMode ? realState : demoState;
+  accounts = realMode ? realState.accounts : DEMO_ACCOUNTS;
+  account = accounts[0]?.id || '';
+  for (const permission of imagePermissions.values()) permission.controller.abort();
+  imagePermissions.clear();
+  resetAccountView();
+  render();
+  if (realMode) {
+    try { await connections.initialize(); }
+    catch (error) { realStatus = error.message; realError = true; render(); }
+  }
+}
+
+function showHome() {
+  if (syncing || sending) {
+    notify('Wait for the current sync or send to finish before returning home.');
+    return;
+  }
+  if (!realMode) demoState = state;
+  homeVisible = true;
+  for (const permission of imagePermissions.values()) permission.controller.abort();
+  imagePermissions.clear();
+  render();
+  window.scrollTo({ top: 0 });
+  document.querySelector('#welcome-title')?.focus({ preventScroll: true });
+}
+
+function homeScreen() {
+  return `<main class="welcome-screen" aria-labelledby="welcome-title">
+    <a class="brand welcome-brand" href="./" data-home aria-label="Gather home"><span class="brand-symbol">${icon('leaf')}</span>gather<span class="brand-dot">.</span></a>
+    <h1 id="welcome-title" tabindex="-1">Welcome to Gather</h1>
+    <p class="welcome-description">Choose how you want to explore your inbox.</p>
+    <div class="welcome-choices">
+      <button class="welcome-choice" data-action="enter-demo" aria-labelledby="demo-choice-title" aria-describedby="demo-choice-description">
+        <span class="welcome-choice-icon">${icon('leaf')}</span>
+        <span class="welcome-choice-title" id="demo-choice-title">Demo</span>
+        <span class="welcome-choice-description" id="demo-choice-description">Explore sample conversations and contacts. No sign-in needed, and no email is sent.</span>
+        <span class="welcome-choice-action">Try the demo ${icon('arrow')}</span>
+      </button>
+      <button class="welcome-choice" data-action="enter-real" aria-labelledby="real-choice-title" aria-describedby="real-choice-description">
+        <span class="welcome-choice-icon">${icon('mail')}</span>
+        <span class="welcome-choice-title" id="real-choice-title">Real mail</span>
+        <span class="welcome-choice-description" id="real-choice-description">Connect Gmail or Outlook to read and send your email. Your mailbox stays on this device.</span>
+        <span class="welcome-choice-action">Open real mail ${icon('arrow')}</span>
+      </button>
+    </div>
+  </main>`;
+}
+
 function providerFolders() {
-  if (!realMode) return '';
-  const folders = state.folders || [];
+  const folders = (state.folders || []).filter((entry) => entry.accountId === account);
   const counts = new Map();
   for (const message of state.messages) {
     for (const id of message.folderIds || []) counts.set(id, (counts.get(id) || 0) + 1);
   }
-  const visibleAccounts = accounts.filter((entry) => account === 'all' || entry.id === account);
   const byId = new Map(folders.map((entry) => [entry.id, entry]));
   const children = new Map();
   const childIds = new Map(folders.map((entry, index) => [entry.id, `provider-folder-children-${index}`]));
@@ -228,53 +290,47 @@ function providerFolders() {
       </div>`;
     }).join('');
   }
-  return `<details class="provider-folders" ${providerFoldersOpen ? 'open' : ''}><summary>Provider folders &amp; labels</summary>
-    <p class="folder-scope-note">Counts are cached messages in your imported date range. Sync mail refreshes all folders for the selected account(s).</p>
-    ${visibleAccounts.map((entry, index) => {
-      const expanded = expandedFolderAccounts.has(entry.id);
-      return `<section class="provider-folder-account" aria-label="${escape(entry.email)} folders">
-        <button class="provider-account-toggle" data-toggle-folder-account="${escape(entry.id)}"
-          aria-expanded="${expanded}" aria-controls="provider-account-folders-${index}" aria-label="${expanded ? 'Collapse' : 'Expand'} folders for ${escape(entry.email)}">
-          ${icon('arrow', expanded ? 'expanded' : '')}${provider(entry.id)}<span>${escape(entry.email)}</span>
-        </button>
-        <div id="provider-account-folders-${index}" class="provider-folder-list" ${expanded ? '' : 'hidden'}>
-          ${children.has(entry.id) ? folderTree(entry.id) : '<p class="folder-scope-note">Sync this account to discover all folders and labels.</p>'}
-        </div>
-      </section>`;
-    }).join('') || '<p class="folder-scope-note">Connect an account to see its folders.</p>'}
+  const virtualFolders = realMode ? (folders.length ? ['outbox'] : ['inbox', 'sent', 'archive', 'outbox'])
+    : ['inbox', 'sent', 'starred', 'archive'];
+  return `<details class="provider-folders" ${providerFoldersOpen ? 'open' : ''}><summary>Folders${realMode ? ' &amp; labels' : ''}</summary>
+    ${account ? `<div class="provider-folder-list">
+      ${realMode ? folderTree(account) : ''}
+      ${virtualFolders.map((id) => `<button class="provider-folder-item ${folder === id ? 'active' : ''}" data-folder="${id}"
+        ${folder === id ? 'aria-current="page"' : ''} title="${labels[id]}">
+        ${icon(id === 'starred' ? 'star' : id === 'archive' ? 'archive' : id === 'inbox' ? 'inbox' : 'sent')}
+        <span>${labels[id]}${realMode && id === 'outbox' ? '<small>Local send attempts</small>' : ''}</span>
+        <span class="provider-folder-count">${visibleConversations(state, { folder: id, account, audience: 'all' }).length}</span>
+      </button>`).join('')}</div>` : '<p class="folder-scope-note">Connect an account to see its folders.</p>'}
+    ${realMode && account ? `<p class="folder-scope-note">${folders.length ? 'Counts show cached messages. Sync refreshes this account.' : 'Sync this account to discover its folders.'}</p>` : ''}
   </details>`;
 }
 
+function brandRow() {
+  return `<header class="brand-row"><a class="brand" href="./" data-home aria-label="Gather home"><span class="brand-symbol">${icon('leaf')}</span>gather<span class="brand-dot">.</span></a>
+    <button class="compose-button mobile-compose" data-action="compose">${icon('plus')} New message</button></header>`;
+}
+
 function sidebar() {
-  return `<aside class="sidebar">
-    <a class="brand" href="./" aria-label="Gather home"><span class="brand-symbol">${icon('leaf')}</span>gather<span class="brand-dot">.</span></a>
-    <button class="compose-button" data-action="compose">${icon('plus')} New message <span class="compose-hint">↗</span></button>
-    ${realMode ? '<button class="text-button connect-entry" data-action="connections">Manage accounts</button>' : ''}
-    <div class="mode-switch" aria-label="Mailbox mode"><button data-action="demo-mode" aria-pressed="${!realMode}">Demo</button><button data-action="real-mode" aria-pressed="${realMode}">Real mail</button></div>
-    ${!realMode ? '<button class="text-button connect-entry" data-action="connections">Connect Gmail or Outlook</button>' : ''}
-    <div class="section-label">YOUR SPACE</div>
-    <nav aria-label="Mail folders">
-      ${navItem('inbox', 'inbox')}
-      ${navItem('unknown', 'unknown', true)}
-      ${navItem('starred', 'star')}
-      ${navItem('sent', 'sent')}
-      ${realMode ? navItem('outbox', 'sent') : ''}
-      ${navItem('archive', 'archive')}
-    </nav>
+  return `<aside class="sidebar" aria-label="Mailbox navigation">
+    <label class="sidebar-select" for="account-select">Account<select id="account-select" ${accounts.length ? '' : 'disabled'}>
+      ${accounts.length ? accounts.map((entry) => `<option value="${escape(entry.id)}" ${entry.id === account ? 'selected' : ''}>${escape(entry.email)} · ${entry.name}</option>`).join('') : '<option value="">No connected accounts</option>'}
+    </select></label>
     ${providerFolders()}
     <nav class="contacts-nav" aria-label="Contacts">
       <div class="nav-divider"></div>
-      ${navItem('contacts', 'people')}
+      <button class="nav-item ${folder === 'contacts' ? 'active' : ''}" data-folder="contacts" ${folder === 'contacts' ? 'aria-current="page"' : ''}>${icon('people')}<span>Contacts</span></button>
     </nav>
-    <div class="accounts-section">
-      <div class="section-label">${realMode ? 'REAL ACCOUNTS' : 'DEMO ACCOUNTS'} <span>${accounts.length}</span></div>
-      <button class="account-item ${account === 'all' ? 'chosen' : ''}" data-account="all" aria-pressed="${account === 'all'}"><span class="all-accounts">${icon('inbox')}</span><span>All accounts<small>A little more connected</small></span>${account === 'all' ? '<span class="account-dot"></span>' : ''}</button>
-      ${accounts.map((item) => `<button class="account-item ${account === item.id ? 'chosen' : ''}" data-account="${escape(item.id)}" aria-pressed="${account === item.id}">${provider(item.id)}<span>${item.name}<small>${escape(item.email)}</small></span>${account === item.id ? '<span class="account-dot"></span>' : ''}</button>`).join('')}
-    </div>
-    <div class="sidebar-bottom"><div class="quiet-note">${icon('leaf')} Less noise.<br><span>More connection.</span></div>
-      <button class="profile" data-action="about">${avatar(realMode ? 'Real Mail' : 'Alex Morgan', 'sand')}<span>${realMode ? 'Your local mailbox' : 'Alex Morgan'}<small>${realMode ? 'Connected mail · This device' : 'Your personal space'}</small></span><span class="profile-more">···</span></button>
-    </div>
   </aside>`;
+}
+
+function senderTabs() {
+  return `<div class="conversation-navigation">
+    <button class="text-button folders-back" data-action="show-folders">${icon('back')} Folders</button>
+    <span class="current-folder-label" title="${escape(folderLabel())}">${escape(folderLabel())}</span>
+    <div class="sender-tabs" role="tablist" aria-label="Conversation senders">
+      ${[['contacts', 'Contacts'], ['unknown', 'Unknown senders']].map(([id, label]) => `<button id="sender-tab-${id}" role="tab"
+        aria-selected="${audience === id}" aria-controls="conversation-results" tabindex="${audience === id ? 0 : -1}" data-audience="${id}">${label}</button>`).join('')}
+    </div></div>`;
 }
 
 function messageList(messages) {
@@ -288,22 +344,32 @@ function messageList(messages) {
     <div class="list-toolbar"><span>${messages.length} conversation${messages.length === 1 ? '' : 's'} <span class="subtle">/ ${groups.length} people</span></span>
       <button class="filter-button ${unreadOnly ? 'enabled' : ''}" data-action="unread-filter" aria-pressed="${unreadOnly}"><span class="tiny-dot"></span> Unread</button>
     </div>
-    ${currentFolder() ? `<div class="folder-note"><strong>${escape(folderLabel())}</strong><br>Read-only provider folder. Showing cached mail in your imported date range.</div>` : ''}
-    ${folder === 'unknown' ? `<div class="folder-note">${realMode ? 'These senders are not in the imported contacts. Add them in Google Contacts or Outlook People, then sync again.' : 'A quieter inbox starts here. Add someone to contacts to bring their messages into your inbox.'}</div>` : ''}
-    <div class="group-list">${groups.length ? groups.map((group) => `<section class="contact-group">
-      <button class="group-heading" data-group="${escape(group.key)}" aria-expanded="${!collapsed.has(group.key)}">
+    <div class="group-list">${groups.length ? groups.map((group, index) => `<section class="contact-group">
+      <button class="group-heading" data-group="${escape(group.key)}" aria-expanded="${expandedGroups.has(groupExpansionKey(group.key))}" aria-controls="group-messages-${index}">
         ${avatar(group.name, group.contact?.color || 'sand')}
         <span class="group-name">${escape(group.name)}<small>${group.messages.length} topic${group.messages.length === 1 ? '' : 's'}${group.messages.some((message) => message.unread) ? ' <span class="unread-label"> · new</span>' : ''}</small></span>
-        ${icon('arrow', collapsed.has(group.key) ? '' : 'expanded')}
+        ${icon('arrow', expandedGroups.has(groupExpansionKey(group.key)) ? 'expanded' : '')}
       </button>
-      ${collapsed.has(group.key) ? '' : `<div class="group-messages">${group.messages.map((message) => `<button class="message-card ${selectedKey === message.key ? 'selected' : ''} ${message.unread ? 'unread' : ''}" data-message="${escape(message.id)}" aria-pressed="${selectedKey === message.key}">
+      <div class="group-messages" id="group-messages-${index}" ${expandedGroups.has(groupExpansionKey(group.key)) ? '' : 'hidden'}>${group.messages.map((message) => `<button class="message-card ${selectedKey === message.key ? 'selected' : ''} ${message.unread ? 'unread' : ''}" data-message="${escape(message.id)}" aria-pressed="${selectedKey === message.key}">
         <span class="message-topline">${provider(message.accountId)}<span>${dateLabel(message.date)} <span class="message-time">· ${time(message.date)}</span></span>${message.starred ? icon('star', 'filled-star') : ''}${message.unread ? '<span class="unread-dot" aria-label="Unread"></span>' : ''}</span>
         <span class="message-subject">${escape(message.subject)} <span class="thread-count" aria-label="${message.messages.length} messages">${message.messages.length}</span></span>
         <span class="message-preview">${message.latest.isDraft ? 'Draft: ' : isOutgoing(message.latest) ? 'You: ' : ''}${escape(messagePreview(message.latest))}</span>
-      </button>`).join('')}</div>`}
+      </button>`).join('')}</div>
     </section>`).join('') : `<div class="empty-state">${icon(query ? 'search' : 'leaf')}<h3>${query ? 'No matching messages' : 'A lovely bit of quiet.'}</h3><p>${query || unreadOnly ? 'Try another search or turn off the unread filter.' : folder === 'sent' ? realMode ? 'Imported sent conversations will appear here.' : 'Your demo conversations will appear here.' : 'There are no messages in this view.'}</p></div>`}</div>
     <div class="list-footer">${icon('check')} A place for people, not noise.</div>
   </section>`;
+}
+
+const compactSearchText = (text) => text.replace(/\s+/g, ' ').trim().toLowerCase();
+
+function conversationSearchTerm(message) {
+  return compactSearchText(conversationSearches.get(conversationKey(message)) || '');
+}
+
+function revealQuotesForSearch(message) {
+  const term = conversationSearchTerm(message);
+  return Boolean(term && !compactSearchText(messagePlainText(message, { hideQuotes: true })).includes(term)
+    && compactSearchText(messagePlainText(message)).includes(term));
 }
 
 function chatMessage(message) {
@@ -319,7 +385,8 @@ function chatMessage(message) {
   const contact = findContact(state.contacts, message.sender);
   const formatted = Boolean(message.bodyHtml) && htmlConversations.has(conversationKey(message));
   const quoteContent = messageQuoteContent(message);
-  const showQuotes = expandedQuotes.has(message.id);
+  const searchQuotes = revealQuotesForSearch(message);
+  const showQuotes = expandedQuotes.has(message.id) || searchQuotes;
   const text = messagePlainText(message, { hideQuotes: !showQuotes });
   const images = imagePermissions.get(message.id);
   const containsImages = /<img\b/i.test(message.bodyHtml || '');
@@ -328,7 +395,7 @@ function chatMessage(message) {
     ${formatted && containsImages ? `<div class="html-controls"><span>${images ? 'Images enabled for this message' : 'Images blocked'}</span><button class="text-button" data-action="${images ? 'hide-images' : 'load-images'}" data-item="${escape(message.id)}">${images ? 'Hide images' : 'Load images'}</button></div>` : ''}
     ${formatted && images?.status ? `<p class="image-status ${images.error ? 'form-error' : ''}" role="${images.error ? 'alert' : 'status'}">${escape(images.status)}</p>` : ''}
     <div class="chat-bubble">${formatted ? `<iframe class="html-message" data-html-message="${escape(message.id)}" title="Formatted email from ${escape(message.senderName)}" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe><div class="html-fallback" hidden><p role="status"></p><div class="message-body">${escape(text || (quoteContent.hasQuotes ? 'Quoted previous messages hidden.' : ''))}</div></div>` : `<div class="message-body">${escape(text || (quoteContent.hasQuotes ? 'Quoted previous messages hidden.' : ''))}</div>`}</div>
-    ${quoteContent.hasQuotes ? `<button class="text-button quote-toggle" data-action="toggle-quotes" data-item="${escape(message.id)}" aria-expanded="${showQuotes}">${showQuotes ? 'Hide quoted text' : 'Show quoted text'}</button>` : ''}
+    ${quoteContent.hasQuotes ? searchQuotes ? '<p class="quote-search-note">Quoted text shown for this search match.</p>' : `<button class="text-button quote-toggle" data-action="toggle-quotes" data-item="${escape(message.id)}" aria-expanded="${showQuotes}">${showQuotes ? 'Hide quoted text' : 'Show quoted text'}</button>` : ''}
     <div class="chat-message-footer"><span>${delivery}${locationNote}${message.unread ? ' · Unread' : ''}</span>
       ${realMode ? '' : `<div class="reader-actions">
         ${!sent ? `<button class="icon-button" data-action="archive" data-item="${escape(message.id)}" aria-label="${message.folder === 'archive' ? 'Move message to inbox' : 'Archive message'}" title="${message.folder === 'archive' ? 'Move to inbox' : 'Archive message'}">${icon(message.folder === 'archive' ? 'inbox' : 'archive')}</button>
@@ -353,11 +420,17 @@ function reader() {
   const from = accounts.find((entry) => entry.id === first.accountId);
   const participants = realMode ? [...new Set(messages.flatMap((message) => message.participants || []))].filter((email) => email !== from.email) : [];
   const key = conversationKey(first);
+  const localQuery = conversationSearches.get(key) || '';
+  const term = conversationSearchTerm(first);
+  const matchingMessages = term ? messages.filter((message) => [
+    message.senderName, message.sender, message.to, message.subject,
+    findContact(state.contacts, conversationAddress(message))?.name, messagePlainText(message),
+  ].filter(Boolean).some((text) => compactSearchText(text).includes(term))) : messages;
   const target = realMode ? replyTarget(messages, from.email) : null;
   const replyDisabled = realMode && (!target || !canSend(from.id) || realBusy || sending);
   const draftOnly = realMode && first.isDraft;
   let previousDay = '';
-  const bubbles = messages.map((message) => {
+  const bubbles = matchingMessages.map((message) => {
     const day = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'long', day: 'numeric' }).format(new Date(message.date));
     const divider = day !== previousDay ? `<li class="chat-day"><span>${escape(day)}</span></li>` : '';
     previousDay = day;
@@ -366,7 +439,11 @@ function reader() {
   return `<article class="reader open chat-reader" aria-label="Conversation with ${escape(name)}">
     <div class="reader-toolbar">
       <button class="icon-button mobile-back" data-action="back" aria-label="Back to message list">${icon('back')}</button>
-      <span class="reader-context">${icon('people')} ${contact ? 'One of your people' : 'A new connection'}</span>
+      <div class="conversation-search">
+        <div class="conversation-search-input">${icon('search')}<input id="conversation-search" type="search" value="${escape(localQuery)}" placeholder="Search within conversation" aria-label="Search within conversation" aria-describedby="conversation-search-count">
+        ${localQuery ? '<button class="text-button" data-action="clear-conversation-search">Clear</button>' : ''}</div>
+        <span id="conversation-search-count" role="status" aria-live="polite">${term ? `${matchingMessages.length} of ${messages.length} messages match` : 'Search only this conversation'}</span>
+      </div>
       <span class="chat-total">${messages.length} message${messages.length === 1 ? '' : 's'} · ${realMode ? 'Imported history' : 'Full conversation'}</span>
     </div>
     <header class="chat-heading">
@@ -382,7 +459,7 @@ function reader() {
       ${!contact && received && !realMode ? `<div class="unknown-callout"><span>This sender isn't in your contacts yet.</span><button data-action="add-sender">${icon('plus')} Add contact</button></div>` : ''}
     </header>
     <div class="chat-timeline" tabindex="0" aria-label="Conversation history, oldest first">
-      <ol class="chat-messages">${bubbles}</ol>
+      ${matchingMessages.length ? `<ol class="chat-messages">${bubbles}</ol>` : '<div class="empty-state conversation-no-results"><h3>No matching messages</h3><p>Try another search or clear it to see the full conversation.</p></div>'}
     </div>
     ${draftOnly ? '<div class="read-only-note">Provider drafts are read-only. Compose a new message to send from Gather.</div>' : `<form id="chat-reply-form" class="chat-reply-form">
       <label for="chat-reply">${realMode ? 'Reply to all' : 'Reply to'} ${escape(realMode && target ? target.toRecipients.join(', ') : name)}${realMode && target?.ccRecipients.length ? `<br>Cc: ${escape(target.ccRecipients.join(', '))}` : ''}</label>
@@ -408,27 +485,42 @@ function render() {
   const existingFolderTree = document.querySelector('.provider-folders');
   if (existingFolderTree) providerFoldersOpen = existingFolderTree.open;
   disposeHtmlMessages();
+  if (homeVisible) {
+    app.dataset.stage = 'home';
+    app.innerHTML = homeScreen();
+    return;
+  }
   const activeSearch = document.activeElement?.id === 'search';
   const cursor = activeSearch ? document.activeElement.selectionStart : null;
+  const scopedSearchFocused = document.activeElement?.id === 'conversation-search';
+  const scopedCursor = scopedSearchFocused ? document.activeElement.selectionStart : null;
   const replyFocused = document.activeElement?.id === 'chat-reply';
   const replySelection = replyFocused ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
   if (folder.startsWith('provider:') && !currentFolder()) {
-    folder = 'inbox'; selected = null; query = ''; unreadOnly = false;
+    resetAccountView();
     notify('That folder is no longer in the synced account. Returned to Inbox.');
   }
-  if (realMode && account !== 'all' && !accounts.some((entry) => entry.id === account)) account = 'all';
+  if (!accounts.some((entry) => entry.id === account)) {
+    account = accounts[0]?.id || '';
+    resetAccountView();
+  }
+  if (realMode && folder === 'inbox') {
+    folder = state.folders?.find((entry) => entry.accountId === account && (entry.kind === 'inbox' || entry.remoteId === 'INBOX'))?.id || folder;
+  }
   const selectedMessage = state.messages.find((message) => message.id === selected);
   const selectedKey = selectedMessage ? conversationKey(selectedMessage) : null;
-  const eligible = visibleConversations(state, { folder, account, query });
+  const eligible = visibleConversations(state, { folder, account, query, audience });
   selected = eligible.find((conversation) => conversation.key === selectedKey)?.id || null;
   const messages = unreadOnly ? eligible.filter((conversation) => conversation.unread) : eligible;
-  app.innerHTML = `${sidebar()}<main class="main">
-    <header class="topbar"><div class="breadcrumb" title="${escape(folderLabel())}">${realMode ? 'Real mail' : 'Your space'} <span>/</span> <strong>${escape(folderLabel())}</strong></div><div class="search-wrap">${icon('search')}<input id="search" type="search" placeholder="${folder === 'contacts' ? 'Find your people...' : 'Search your conversations...'}" value="${escape(query)}" aria-label="${folder === 'contacts' ? 'Search contacts' : 'Search messages'}"><span class="search-key">/</span></div>
+  app.dataset.stage = folder === 'contacts' ? 'contacts' : selected ? 'reader' : folderChosen ? 'list' : 'folders';
+  app.innerHTML = `${brandRow()}
+    <header class="topbar"><button class="compose-button desktop-compose" data-action="compose">${icon('plus')} New message</button><div class="search-wrap">${icon('search')}<input id="search" type="search" placeholder="${folder === 'contacts' ? 'Find your people...' : 'Search your conversations...'}" value="${escape(query)}" aria-label="${folder === 'contacts' ? 'Search contacts' : 'Search messages'}"><span class="search-key">/</span></div>
       <div class="sync-area"><button class="sync-button" data-action="sync" ${syncing || realBusy ? 'disabled' : ''}>${icon('sync', syncing || realBusy ? 'spinning' : '')} ${realMode ? sending ? 'Sending...' : realBusy ? 'Syncing...' : 'Sync mail' : syncing ? 'Syncing demo...' : 'Sync demo'}</button><span>${state.lastSync ? `Last ${realMode ? 'sync' : 'demo sync'} ${dateLabel(state.lastSync)} ${time(state.lastSync)}` : realMode ? 'Connect your accounts' : 'Sample mail & contacts'}</span></div>
     </header>
+    ${sidebar()}<main class="main">
     ${storageError && !realMode ? `<div class="storage-error" role="alert">${escape(storageError)}</div>` : ''}
-    ${realMode ? `<div class="real-status ${realError ? 'storage-error' : ''}" role="${realError ? 'alert' : 'status'}">${escape(realStatus || (accounts.length ? 'Cached mail is available offline. Reconnect to sync or send.' : 'No real accounts connected yet. Use Manage accounts to connect Gmail or Outlook.'))} <button class="text-button" data-action="connections">Accounts</button>${realBusy && !sending ? '<button class="text-button" data-action="cancel-real-sync">Cancel</button>' : ''}</div>` : ''}
-    ${folder === 'contacts' ? contactsPage() : `<div class="mail-workspace ${selected ? 'has-selection' : ''}">${messageList(messages)}${reader()}</div>`}
+    <div class="real-status ${realMode && realError ? 'storage-error' : ''} ${realMode && realBusy ? 'sync-active' : ''}" role="${realMode && realError ? 'alert' : 'status'}">${escape(realMode ? realStatus || (accounts.length ? 'Cached mail is available offline. Reconnect to sync or send.' : 'No real accounts connected yet. Use Accounts to connect Gmail or Outlook.') : 'Sample mail and contacts. Connect your accounts to use real email.')} <button class="text-button" data-action="connections">Accounts</button>${realMode && realBusy && !sending ? '<button class="text-button" data-action="cancel-real-sync">Cancel</button>' : ''}</div>
+    ${folder === 'contacts' ? `<button class="text-button folders-back" data-action="show-folders">${icon('back')} Folders</button>${contactsPage()}` : `${senderTabs()}<div id="conversation-results" role="tabpanel" aria-labelledby="sender-tab-${audience}" class="mail-workspace ${selected ? 'has-selection' : ''}">${messageList(messages)}${reader()}</div>`}
     <footer class="app-footer"><span><span class="status-dot"></span> Your inbox, a little more human.</span><span>${realMode ? 'Real mail · Local cache · Sending enabled with consent' : 'Sample data only. No email is sent. <button data-action="reset">Reset demo</button>'}</span></footer>
   </main>`;
   document.querySelector('.provider-folders')?.addEventListener('toggle', (event) => {
@@ -441,7 +533,7 @@ function render() {
   }, (message) => {
     const permission = imagePermissions.get(message.id);
     return permission?.bodyHtml === message.bodyHtml ? { loadImages: true, inlineImages: permission.images } : {};
-  }, (message) => expandedQuotes.has(message.id) ? message.bodyHtml : messageQuoteContent(message).bodyHtml);
+  }, (message) => expandedQuotes.has(message.id) || revealQuotesForSearch(message) ? message.bodyHtml : messageQuoteContent(message).bodyHtml);
   if (activeSearch) {
     const input = document.querySelector('#search');
     input.focus();
@@ -451,6 +543,11 @@ function render() {
     const input = document.querySelector('#chat-reply');
     input.focus({ preventScroll: true });
     input.setSelectionRange(...replySelection);
+  }
+  if (scopedSearchFocused && document.querySelector('#conversation-search')) {
+    const input = document.querySelector('#conversation-search');
+    input.focus({ preventScroll: true });
+    input.setSelectionRange(scopedCursor, scopedCursor);
   }
 }
 
@@ -469,6 +566,15 @@ function openComposer(to = '', subject = '', accountId = account === 'all' ? acc
   form.querySelector('[type="submit"]').textContent = realMode ? 'Send email' : 'Save to demo Sent';
   composeDialog.showModal();
   form.elements[to ? 'body' : 'to'].focus();
+}
+
+function revealConversation(message) {
+  account = message.accountId;
+  folder = state.folders?.find((entry) => entry.accountId === account && (entry.kind === 'sent' || entry.remoteId === 'SENT'))?.id || 'sent';
+  folderChosen = true; selected = message.id; query = ''; unreadOnly = false;
+  audience = findContact(state.contacts, conversationAddress(message)) ? 'contacts' : 'unknown';
+  const group = findContact(state.contacts, conversationAddress(message))?.id || conversationAddress(message).trim().toLowerCase();
+  expandedGroups.add(groupExpansionKey(group));
 }
 
 function refreshEmailLabels() {
@@ -536,6 +642,12 @@ emailRows.addEventListener('click', (event) => {
 });
 
 app.addEventListener('input', (event) => {
+  if (event.target.id === 'conversation-search') {
+    const message = state.messages.find((entry) => entry.id === selected);
+    if (message) conversationSearches.set(conversationKey(message), event.target.value);
+    render();
+    return;
+  }
   if (event.target.id === 'search') {
     query = event.target.value;
     render();
@@ -544,6 +656,26 @@ app.addEventListener('input', (event) => {
     const message = state.messages.find((entry) => entry.id === selected);
     if (message) replyDrafts.set(conversationKey(message), event.target.value);
   }
+});
+
+app.addEventListener('change', async (event) => {
+  if (event.target.id === 'account-select') {
+    const next = event.target.value;
+    if (!accounts.some((entry) => entry.id === next)) return;
+    account = next;
+    resetAccountView();
+    render();
+    document.querySelector('#account-select')?.focus({ preventScroll: true });
+  }
+});
+
+app.addEventListener('keydown', (event) => {
+  const tab = event.target.closest('[data-audience]');
+  if (!tab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const next = event.key === 'Home' ? 'contacts' : event.key === 'End' ? 'unknown'
+    : tab.dataset.audience === 'contacts' ? 'unknown' : 'contacts';
+  document.querySelector(`[data-audience="${next}"]`)?.click();
 });
 
 app.addEventListener('submit', async (event) => {
@@ -566,6 +698,7 @@ app.addEventListener('submit', async (event) => {
         to: target.toRecipients, cc: target.ccRecipients, subject: target.parent.subject || '(No subject)', body, replyToId: target.parent.id,
       });
       if (replyDrafts.get(key) === originalDraft) replyDrafts.delete(key);
+      conversationSearches.delete(key);
       notify(result.warning || 'Email accepted by the provider and added to the conversation.');
     } catch (error) { replyErrors.set(key, error.message); }
     finally { sending = false; render(); }
@@ -575,6 +708,7 @@ app.addEventListener('submit', async (event) => {
   try {
     const updated = replyToConversation(state, selected, new FormData(event.target).get('body'));
     replyDrafts.delete(conversationKey(message));
+    conversationSearches.delete(conversationKey(message));
     state = updated;
   } catch (error) {
     event.target.querySelector('.form-error').textContent = error.message;
@@ -588,16 +722,27 @@ app.addEventListener('submit', async (event) => {
 });
 
 app.addEventListener('click', async (event) => {
-  const button = event.target.closest('button[data-folder], button[data-provider-folder], button[data-toggle-folder-account], button[data-toggle-provider-folder], button[data-account], button[data-group], button[data-message], button[data-write], button[data-edit-contact], button[data-action]');
+  if (event.target.closest('a[data-home]')) {
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    showHome();
+    return;
+  }
+  const button = event.target.closest('button[data-folder], button[data-provider-folder], button[data-toggle-provider-folder], button[data-audience], button[data-group], button[data-message], button[data-write], button[data-edit-contact], button[data-action]');
   if (!button) return;
-  if (button.dataset.toggleFolderAccount || button.dataset.toggleProviderFolder) {
-    const attribute = button.dataset.toggleFolderAccount ? 'toggleFolderAccount' : 'toggleProviderFolder';
-    const id = button.dataset[attribute];
-    const expanded = attribute === 'toggleFolderAccount' ? expandedFolderAccounts : expandedFolderBranches;
-    if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
+  if (button.dataset.toggleProviderFolder) {
+    const id = button.dataset.toggleProviderFolder;
+    if (expandedFolderBranches.has(id)) expandedFolderBranches.delete(id); else expandedFolderBranches.add(id);
     render();
-    [...app.querySelectorAll('button[data-toggle-folder-account], button[data-toggle-provider-folder]')]
-      .find((entry) => entry.dataset[attribute] === id)?.focus({ preventScroll: true });
+    [...app.querySelectorAll('button[data-toggle-provider-folder]')]
+      .find((entry) => entry.dataset.toggleProviderFolder === id)?.focus({ preventScroll: true });
+    return;
+  }
+  if (button.dataset.audience) {
+    audience = button.dataset.audience;
+    selected = null;
+    render();
+    document.querySelector(`[data-audience="${audience}"]`)?.focus({ preventScroll: true });
     return;
   }
   if (realMode && ['star', 'read', 'archive', 'reset'].includes(button.dataset.action)) {
@@ -607,21 +752,15 @@ app.addEventListener('click', async (event) => {
   if (button.dataset.providerFolder) {
     const target = state.folders?.find((entry) => entry.id === button.dataset.providerFolder);
     if (!target) { notify('This folder is no longer available. Sync to refresh the folder list.'); return; }
-    folder = target.id; account = target.accountId; selected = null; query = ''; unreadOnly = false;
+    account = target.accountId; selectFolder(target.id);
   } else if (button.dataset.folder) {
-    folder = button.dataset.folder;
-    selected = null;
-    query = '';
-    unreadOnly = false;
-  } else if (button.dataset.account) {
-    account = button.dataset.account;
-    if (folder.startsWith('provider:')) { folder = 'inbox'; query = ''; unreadOnly = false; }
-    selected = null;
+    selectFolder(button.dataset.folder);
   } else if (button.dataset.group) {
-    const key = button.dataset.group;
-    if (collapsed.has(key)) collapsed.delete(key); else collapsed.add(key);
+    const key = groupExpansionKey(button.dataset.group);
+    if (expandedGroups.has(key)) expandedGroups.delete(key); else expandedGroups.add(key);
   } else if (button.dataset.message) {
     selected = button.dataset.message;
+    folderChosen = true;
     if (!realMode) {
       conversationMessages(state, selected).forEach((message) => { message.unread = false; });
       persist();
@@ -635,25 +774,18 @@ app.addEventListener('click', async (event) => {
   } else {
     const message = state.messages.find((entry) => entry.id === (button.dataset.item || selected));
     switch (button.dataset.action) {
+      case 'clear-conversation-search':
+        if (message) conversationSearches.delete(conversationKey(message));
+        render();
+        document.querySelector('#conversation-search')?.focus({ preventScroll: true });
+        return;
+      case 'enter-demo':
+      case 'enter-real':
+        await switchMode(button.dataset.action === 'enter-real');
+        document.querySelector('#account-select:not(:disabled), .desktop-compose')?.focus({ preventScroll: true });
+        return;
       case 'connections': await connections.show(); return;
       case 'cancel-real-sync': connections.cancel(); return;
-      case 'real-mode':
-      case 'demo-mode': {
-        if (syncing || sending) { notify('Wait for the current sync or send to finish before switching mailboxes.'); return; }
-        if (!realMode) demoState = state;
-        realMode = button.dataset.action === 'real-mode';
-        state = realMode ? realState : demoState;
-        accounts = realMode ? realState.accounts : DEMO_ACCOUNTS;
-        for (const permission of imagePermissions.values()) permission.controller.abort();
-        imagePermissions.clear();
-        folder = 'inbox'; account = 'all'; selected = null; query = ''; unreadOnly = false;
-        render();
-        if (realMode) {
-          try { await connections.initialize(); }
-          catch (error) { realStatus = error.message; realError = true; render(); }
-        }
-        return;
-      }
       case 'compose': openComposer(); return;
       case 'remove-send-attempt':
         if (!confirm('Remove this local send attempt?\n\nFirst check Sent at your email provider. The message may already have been sent. Removing this record does not recall it and allows another identical send, which could create a duplicate.')) return;
@@ -708,6 +840,10 @@ app.addEventListener('click', async (event) => {
         notify('Images hidden. Requests already made cannot be undone.');
         break;
       case 'back': selected = null; break;
+      case 'show-folders':
+        folderChosen = false; selected = null;
+        if (folder === 'contacts') { folder = 'inbox'; query = ''; }
+        break;
       case 'unread-filter': unreadOnly = !unreadOnly; selected = null; break;
       case 'star': message.starred = !message.starred; persist(); break;
       case 'read': message.unread = !message.unread; persist(); break;
@@ -746,10 +882,12 @@ app.addEventListener('click', async (event) => {
           return;
         }
         state = createDemo();
-        folder = 'inbox'; account = 'all'; selected = 'm1'; query = ''; unreadOnly = false;
-        collapsed.clear();
+        account = accounts[0]?.id || '';
+        resetAccountView();
+        expandedGroups.clear();
         replyDrafts.clear();
         htmlConversations.clear();
+        conversationSearches.clear();
         expandedQuotes.clear();
         for (const permission of imagePermissions.values()) permission.controller.abort();
         imagePermissions.clear();
@@ -759,9 +897,11 @@ app.addEventListener('click', async (event) => {
     }
   }
   render();
-  if (button.dataset.providerFolder) document.querySelector('.message-list')?.scrollIntoView({ block: 'start' });
+  if (button.dataset.providerFolder || button.dataset.folder) document.querySelector('.conversation-navigation, .contacts-page')?.scrollIntoView({ block: 'start' });
+  if (button.dataset.group) [...document.querySelectorAll('[data-group]')].find((entry) => entry.dataset.group === button.dataset.group)?.focus({ preventScroll: true });
   if (button.dataset.message) document.querySelector('.chat-reader')?.scrollIntoView({ block: 'start' });
   if (button.dataset.action === 'back') document.querySelector('.message-list')?.scrollIntoView({ block: 'start' });
+  if (button.dataset.action === 'show-folders') document.querySelector('.brand-row')?.scrollIntoView({ block: 'start' });
 });
 
 document.querySelectorAll('[data-close]').forEach((button) =>
@@ -801,7 +941,7 @@ document.querySelector('#compose-form').addEventListener('submit', async (event)
       [...form.elements].forEach(element => { element.disabled = true; });
       form.querySelector('.form-error').textContent = '';
       const result = await connections.send(from.id, { to: recipients, subject: values.get('subject'), body: values.get('body') });
-      folder = 'sent'; account = from.id; selected = result.message.id; query = ''; unreadOnly = false;
+      revealConversation(result.message);
       composeDialog.close();
       notify(result.warning || 'Email accepted by the provider. Its Sent copy will be confirmed on sync.');
     } catch (error) { form.querySelector('.form-error').textContent = error.message; }
@@ -827,7 +967,7 @@ document.querySelector('#compose-form').addEventListener('submit', async (event)
     body: values.get('body').trim(), date: new Date().toISOString(), folder: 'sent', unread: false, starred: false,
   };
   state.messages.push(message);
-  folder = 'sent'; account = from.id; selected = message.id; query = ''; unreadOnly = false;
+  revealConversation(message);
   persist();
   composeDialog.close();
   notify('Saved to demo Sent. No email was delivered.');
@@ -839,15 +979,16 @@ document.addEventListener('keydown', (event) => {
     && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)
     && !document.querySelector('dialog[open]')) {
     event.preventDefault();
-    document.querySelector('#search').focus();
+    (selected ? document.querySelector('#conversation-search') : document.querySelector('#search'))?.focus();
   }
 });
 
 async function refreshRealMail() {
-  if (!realMode || document.hidden || sending) return;
+  if (homeVisible || !realMode || document.hidden || sending) return;
   try { await connections.syncWhenDue(); }
   catch (error) { realStatus = error.message; realError = true; render(); }
 }
 document.addEventListener('visibilitychange', refreshRealMail);
+mobileLayout.addEventListener('change', () => render());
 setInterval(refreshRealMail, 5 * 60000);
 render();

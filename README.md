@@ -91,12 +91,65 @@ page has `no-store`, local scripts only, and **no COOP header**, as required by
 MSAL's popup bridge. There is no catch-all navigation fallback: excluded files
 return 404 instead of the app page. The app's existing meta CSP remains active.
 
+## Layout and navigation
+
+Opening the root page shows a clean welcome screen with two large buttons:
+**Demo** (sample mail without sign-in or real sending) and **Real mail**
+(connected Gmail/Outlook accounts). Clicking or tapping the Gather logo returns
+to this screen without deleting cached mail, losing in-memory reply drafts, or
+signing out. No mailbox is opened automatically on reload. The home screen does
+not start automatic syncing, and returning home clears image-display permissions.
+If a send or demo sync is in progress, finish it before returning home.
+
+On wide screens (over 900px), the left column contains the Gather logo,
+**Account** dropdown, the selected account's
+folder tree, and the **Contacts** address-book link. The right column starts with
+**New message**, search, and Sync; sync information and the Accounts link remain
+below that toolbar.
+
+**Contacts / Unknown senders** tabs filter the conversations in the selected
+folder. They are not folders and do not open the address book. Sent messages are
+classified by recipient; received messages by sender. Search and the unread
+filter combine with the current account, folder, and tab. A mixed-participant
+provider thread may qualify for both tabs, but opening it always shows the full
+imported thread. The folder label above the list identifies the current view.
+
+Contact groups in the conversation list start **collapsed**. Expand a person to
+see their topics, then select a topic to read it. Expansion is remembered within
+each account/folder/tab in the current session, without persisting on reload.
+Conversations still default to plain text, with the existing HTML/image controls.
+
+On mobile (900px and narrower), navigation is ordered as: logo and New message;
+search and Sync; account dropdown; folder tree; Contacts.
+Selecting a folder hides the navigation below search/Sync and shows the sender
+tabs and collapsed conversation list. Selecting a conversation replaces the list
+with the reader. The reader's back arrow returns to the list; **Folders** returns
+to the dropdowns/tree. The Contacts address book has the same Folders return
+control. In the mobile reader, the mailbox search/Sync toolbar and folder/sender
+tabs are replaced by **Search within conversation**. It filters received and sent
+messages in that conversation, shows a match count and a clear control, and never
+changes the mailbox search or the selected topic. Matches in quoted history
+temporarily reveal that text. Each conversation remembers its search in the
+current tab. Desktop also offers this search in the reader toolbar, replacing
+the "One of your people" label, while keeping the mailbox toolbar. Search stays
+active across screen-size changes. Returning
+to the mobile list restores the mailbox controls. Mobile message and input text
+is at least 16px, with larger navigation controls. Routine sync information is
+hidden in the mobile list/reader, but active progress, cancellation, and errors
+remain visible.
+
+The first account is selected after choosing a mailbox on the welcome screen.
+The account dropdown replaces the previous all-accounts list; switching account
+or choosing a mailbox from the welcome screen resets to that
+account's Inbox and Contacts tab. In mobile navigation, select a folder to open
+its list. If no real accounts exist, use the Accounts link to connect one.
+
 ## Demo behavior
 
-- Sample Gmail and Outlook.com accounts share a unified inbox, with account filters.
+- Sample Gmail and Outlook.com accounts are selected with the account dropdown.
 - Inbox messages are grouped by known contact, including contacts with multiple
   email addresses. Matching is case-insensitive and uses exact email addresses,
-  not display names. Contacts are shared across the unified inbox.
+  not display names. Contact matching uses the mailbox mode's shared contact book.
 - Each topic opens as a chat: received messages appear on the left and local sent
   messages on the right, oldest first, with timestamps and date dividers.
   The list shows one card per conversation, its latest message, and message count.
@@ -163,8 +216,8 @@ return 404 instead of the app page. The app's existing meta CSP remains active.
   provider thread IDs and email reply headers in a real integration.
 - Fresh demo data includes a sent reply in Maya's getaway conversation. Existing
   saved data is preserved; write an inline reply to try the chat without resetting.
-- Unknown senders appear only in the **Unknown senders** subfolder. Adding their
-  address to contacts immediately reclassifies all their inbox messages.
+- Unknown correspondents appear in the **Unknown senders** tab of each folder.
+  Adding their address to contacts immediately reclassifies their conversations.
 - In **Contacts**, use **Edit contact** to rename someone or add, change, and remove
   their email addresses. New contacts can also have multiple addresses. At least
   one valid address is required, and addresses cannot be repeated within a contact
@@ -333,23 +386,23 @@ match the registration exactly, including hostname, path, scheme, and port.
 | Gmail | All messages since the chosen start date, including Drafts, Spam, and Trash. All system and custom labels are discovered, including hidden labels and slash-nested labels. Gmail `historyId` tracks message and label changes. A message with multiple labels is stored once and can appear under each matching label. | Google People `connections`, including all pages with email addresses; refreshed on each sync. Other Contacts and Workspace directory searches are not included. |
 | Outlook | All mail folders returned by Microsoft Graph, traversing nested folders and including hidden folders, Drafts, Junk Email, Deleted Items, Outbox, and search folders. Each physical folder uses its own delta link and immutable message IDs. Drafts, Outbox, and search folders use regular paginated refreshes. | The default Outlook contacts folder, including all pages; refreshed on each sync. Organizational directory and custom contact folders are not included. |
 
-The **Provider folders & labels** browser appears in the **left pane above
-Contacts** in Real mail. Every account starts collapsed. Use the account
-chevron to reveal its folders and a parent folder's chevron to expand or collapse
-its children; click the folder name to select it. Nested folders start collapsed
-too. Expansion choices survive navigation, filtering, and sync in the current
-tab, but reset on reload. Collapsing a branch does not change the selected
-conversation or stop syncing it. Selecting a folder shows every matching cached conversation,
-regardless of whether its sender is a known contact. The existing contact-grouped
-Inbox and Unknown senders views still include only inbox messages. Spam, Trash,
-and drafts do not enter those views merely because their sender is a contact.
-Custom Outlook folders are not incorrectly grouped into the unified Archive.
+The **Folders & labels** tree appears in the **left pane above Contacts** in
+Real mail and shows only the account selected in the dropdown. Its top-level
+folders are visible without a second account expander. Use a parent folder's
+chevron to expand or collapse its children; click the folder name to select it.
+Nested folders start collapsed. Expansion choices survive navigation, filtering,
+and sync in the current tab, but reset on reload. Collapsing a branch does not
+change the selected conversation or stop syncing it. The Contacts/Unknown
+senders tabs filter the cached conversations belonging to the selected folder.
+Spam, Trash, and drafts remain in their actual folders and do not enter Inbox
+merely because their sender is a contact.
 
 Folder counts are cached **messages**, while conversation-list counts are
 **topics**; neither claims to be the provider's all-time mailbox total. Empty
 folders remain selectable. Search and unread filters apply within the selected
-folder. Selecting a folder selects its account; **Sync mail** refreshes all folders
-for that account. Select **All accounts** to refresh every connected account.
+folder. **Sync mail** refreshes all folders for the account selected in the dropdown;
+select another account to sync it manually. Automatic background sync still
+refreshes authorized accounts while Real mail is open.
 No per-folder write permissions are requested, and no provider folders are created.
 
 Folder catalogs are rediscovered each sync. Renames keep their stable folder IDs,

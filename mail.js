@@ -135,17 +135,18 @@ export function createDemo() {
   };
 }
 
-export function visibleMessages(state, { folder = 'inbox', account = 'all', query = '', unread = false } = {}) {
+export function visibleMessages(state, { folder = 'inbox', account = 'all', query = '', unread = false, audience = null } = {}) {
   const search = query.trim().toLowerCase();
   return state.messages.filter((message) => {
     const contact = findContact(state.contacts, message.sender);
     const matchesFolder = folder === 'inbox'
-      ? message.folder === 'inbox' && Boolean(contact)
+      ? message.folder === 'inbox' && (audience !== null || Boolean(contact))
       : folder === 'unknown'
         ? message.folder === 'inbox' && !contact
         : folder === 'starred' ? message.starred && !['spam', 'trash', 'drafts'].includes(message.folder)
           : folder.startsWith('provider:') ? message.folderIds?.includes(folder) : message.folder === folder;
     return matchesFolder && (account === 'all' || message.accountId === account)
+      && (audience === null || audience === 'all' || Boolean(findContact(state.contacts, conversationAddress(message))) === (audience === 'contacts'))
       && (!unread || message.unread)
       && (!search || matchesSearch(message, state.contacts, search));
   }).sort((a, b) => Date.parse(b.date) - Date.parse(a.date));

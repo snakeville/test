@@ -31,6 +31,189 @@ try {
     .replace('<head>', `<head>${storage}`);
   await loaded;
   const documentInFrame = frame.contentDocument;
+  const windowInFrame = frame.contentWindow;
+  const waitFor = async (check) => {
+    for (let attempt = 0; attempt < 150; attempt++) {
+      if (check()) return;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    throw new Error('Timed out waiting for UI update');
+  };
+  const changeSelect = (selector, value) => {
+    const input = documentInFrame.querySelector(selector);
+    input.value = value;
+    input.dispatchEvent(new windowInFrame.Event('change', { bubbles: true }));
+  };
+  const click = (selector) => {
+    let element = documentInFrame.querySelector(selector);
+    if (!element) throw new Error(`Missing ${selector}`);
+    if (element.matches('[data-message]')) {
+      const group = element.closest('.group-messages');
+      if (group?.hidden) {
+        const id = element.dataset.message;
+        group.closest('.contact-group').querySelector('[data-group]').click();
+        element = [...documentInFrame.querySelectorAll('[data-message]')].find(button => button.dataset.message === id);
+      }
+    }
+    element.click();
+  };
+  const chooseFolder = (id) => {
+    const virtual = documentInFrame.querySelector(`[data-folder="${id}"]`);
+    if (virtual) { virtual.click(); return; }
+    const names = { inbox: 'Inbox', sent: 'Sent', archive: 'Archive' };
+    const provider = [...documentInFrame.querySelectorAll('[data-provider-folder]')].find(button => button.title === names[id]);
+    if (!provider) throw new Error(`Missing folder ${id}`);
+    provider.click();
+  };
+  const chooseMode = (mode) => {
+    if (!documentInFrame.querySelector('.welcome-screen')) click('a[data-home]');
+    click(`[data-action="enter-${mode}"]`);
+  };
+  frame.style.width = '1200px';
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert(documentInFrame.querySelector('#app').dataset.stage === 'home'
+    && documentInFrame.querySelector('.welcome-screen'), 'Root page opens on the clean welcome screen');
+  assert(documentInFrame.querySelectorAll('.welcome-choice').length === 2, 'Welcome offers two large Demo and Real mail choices');
+  assert(documentInFrame.querySelector('#demo-choice-description').textContent.includes('No sign-in')
+    && documentInFrame.querySelector('#real-choice-description').textContent.includes('Gmail or Outlook'),
+    'Each mailbox choice has a clear description');
+  assert(!documentInFrame.querySelector('.sidebar, .topbar, .message-list, .real-status'),
+    'Welcome does not expose mailbox navigation or message data');
+  assert(documentInFrame.querySelector('.welcome-choice').getBoundingClientRect().height >= 230, 'Mailbox choice buttons have a generous touch target');
+  click('[data-action="enter-demo"]');
+  assert(!documentInFrame.querySelector('.breadcrumb, .mode-switch, .account-item'), 'Legacy breadcrumbs, mode switch, and account lists are removed');
+  assert(!documentInFrame.querySelector('#mailbox-mode') && documentInFrame.querySelector('.sidebar #account-select'),
+    'Mailbox dropdown is removed while account selection stays in the sidebar');
+  assert(documentInFrame.querySelector('#account-select').value === 'gmail', 'Demo selects the first account rather than mixing mailboxes');
+  assert([...documentInFrame.querySelectorAll('[data-group]')].every(button => button.getAttribute('aria-expanded') === 'false'),
+    'Conversation groups start collapsed');
+  assert(!documentInFrame.querySelector('.chat-reader'), 'No conversation is selected automatically');
+  const rect = selector => documentInFrame.querySelector(selector).getBoundingClientRect();
+  const visible = element => Boolean(element?.checkVisibility({ checkVisibilityCSS: true }));
+  assert(rect('.brand-row').left < rect('.topbar').left && rect('.sidebar').left < rect('.main').left,
+    'Wide layout places logo and navigation on the left and toolbar and conversations on the right');
+  assert(visible(documentInFrame.querySelector('.topbar .desktop-compose'))
+    && !visible(documentInFrame.querySelector('.mobile-compose')), 'Wide toolbar contains New message rather than breadcrumbs');
+  assert(rect('#account-select').top < rect('.provider-folders').top
+    && rect('.provider-folders').bottom <= rect('.contacts-nav').top,
+    'Sidebar order is account dropdown, folders, then Contacts');
+  assert(documentInFrame.querySelectorAll('.message-card').length === 5
+    && ![...documentInFrame.querySelectorAll('.message-card')].some(visible), 'Selected-account list is collapsed by default');
+  click('[data-audience="unknown"]');
+  assert(documentInFrame.querySelectorAll('.message-card').length === 2
+    && documentInFrame.querySelector('[data-audience="unknown"]').getAttribute('aria-selected') === 'true',
+    'Unknown senders tab filters only the current account and folder');
+  documentInFrame.querySelector('[data-audience="unknown"]').dispatchEvent(new windowInFrame.KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+  assert(documentInFrame.querySelector('[data-audience="contacts"]').getAttribute('aria-selected') === 'true',
+    'Sender tabs support keyboard navigation');
+  changeSelect('#account-select', 'outlook');
+  assert(documentInFrame.querySelectorAll('.message-card').length === 2
+    && documentInFrame.querySelector('#account-select').value === 'outlook', 'Changing account shows only that account’s conversations');
+  changeSelect('#account-select', 'gmail');
+  chooseFolder('sent');
+  assert(documentInFrame.querySelectorAll('.message-card').length === 1, 'Folder tree filters selected account mail');
+  click('[data-audience="unknown"]');
+  assert(!documentInFrame.querySelector('.message-card'), 'Unknown senders tab does not leak inbox mail into Sent');
+  chooseFolder('inbox');
+  click('[data-audience="contacts"]');
+  frame.style.width = '390px';
+  await new Promise(resolve => setTimeout(resolve, 80));
+  click('a[data-home]');
+  assert(documentInFrame.querySelector('.welcome-screen') && !documentInFrame.querySelector('.sidebar'),
+    'Tapping the mobile logo returns to a clean home screen');
+  const mobileChoices = [...documentInFrame.querySelectorAll('.welcome-choice')].map(element => element.getBoundingClientRect());
+  assert(mobileChoices[0].bottom <= mobileChoices[1].top, 'Mobile welcome choices stack vertically');
+  assert(documentInFrame.documentElement.scrollWidth <= windowInFrame.innerWidth, 'Mobile welcome fits without horizontal overflow');
+  click('[data-action="enter-demo"]');
+  click('[data-action="show-folders"]');
+  assert(documentInFrame.querySelector('#app').dataset.stage === 'folders' && visible(documentInFrame.querySelector('.sidebar')),
+    'Mobile folder selection exposes navigation instead of conversations');
+  assert(rect('.brand-row').bottom <= rect('.topbar').top
+    && rect('.topbar').bottom <= rect('.sidebar').top, 'Mobile order is logo/New message, search/Sync, then navigation');
+  assert(visible(documentInFrame.querySelector('.mobile-compose')) && !visible(documentInFrame.querySelector('.desktop-compose')),
+    'Mobile New message sits beside the logo');
+  assert(parseFloat(windowInFrame.getComputedStyle(documentInFrame.querySelector('#search')).fontSize) >= 16
+    && parseFloat(windowInFrame.getComputedStyle(documentInFrame.querySelector('#account-select')).fontSize) >= 16,
+    'Mobile inputs have readable 16px text');
+  assert(!visible(documentInFrame.querySelector('.mail-workspace')), 'Conversation list is hidden until a mobile folder is chosen');
+  chooseFolder('inbox');
+  assert(!visible(documentInFrame.querySelector('.sidebar'))
+    && visible(documentInFrame.querySelector('.topbar')) && visible(documentInFrame.querySelector('.sender-tabs')),
+    'Choosing a folder replaces mobile dropdowns and folder tree with sender tabs and conversations');
+  assert(!visible(documentInFrame.querySelector('.real-status')), 'Mobile folder view keeps search/Sync but removes sync-info clutter below it');
+  assert([...documentInFrame.querySelectorAll('[data-group]')].every(button => button.getAttribute('aria-expanded') === 'false'),
+    'Mobile conversations remain collapsed until explicitly expanded');
+  click('[data-message="m1"]');
+  assert(visible(documentInFrame.querySelector('.chat-reader')) && !visible(documentInFrame.querySelector('.message-list')),
+    'Mobile conversation selection shows the chat instead of the list');
+  assert(parseFloat(windowInFrame.getComputedStyle(documentInFrame.querySelector('.message-body')).fontSize) >= 16,
+    'Mobile message body uses increased font size');
+  assert(!visible(documentInFrame.querySelector('.topbar')) && !visible(documentInFrame.querySelector('.conversation-navigation')),
+    'Mobile reader hides mailbox search, Sync, folder navigation, and sender tabs');
+  assert(visible(documentInFrame.querySelector('#conversation-search'))
+    && documentInFrame.querySelector('#conversation-search').placeholder === 'Search within conversation',
+    'Mobile reader offers a dedicated conversation search');
+  const searchConversation = value => {
+    const input = documentInFrame.querySelector('#conversation-search');
+    input.focus();
+    input.value = value;
+    input.dispatchEvent(new windowInFrame.Event('input', { bubbles: true }));
+  };
+  searchConversation('FIREPLACE');
+  assert(documentInFrame.querySelectorAll('[data-chat-message]').length === 1
+    && documentInFrame.querySelector('[data-chat-message]').dataset.chatMessage === 'm1',
+    'Conversation search filters received messages case-insensitively');
+  assert(documentInFrame.querySelector('#conversation-search-count').textContent === '1 of 2 messages match',
+    'Conversation search displays matching message count');
+  assert(documentInFrame.activeElement.id === 'conversation-search' && documentInFrame.querySelector('#search').value === '',
+    'Conversation search preserves input focus and leaves mailbox search unchanged');
+  searchConversation('book pile');
+  assert(documentInFrame.querySelector('[data-chat-message]').classList.contains('outgoing'),
+    'Conversation search includes sent message text');
+  searchConversation('Saturday coffee');
+  assert(documentInFrame.querySelector('.conversation-no-results') && documentInFrame.querySelector('.chat-reader'),
+    'No-results search stays in this conversation and does not match another topic');
+  assert(documentInFrame.querySelector('#chat-reply-form'), 'A no-results search does not remove the reply form');
+  searchConversation('fireplace');
+  frame.style.width = '1200px';
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert(visible(documentInFrame.querySelector('.reader-toolbar .conversation-search'))
+    && documentInFrame.querySelectorAll('[data-chat-message]').length === 1 && visible(documentInFrame.querySelector('.topbar')),
+    'Desktop shows conversation search in the reader toolbar and retains the mailbox toolbar');
+  assert(!documentInFrame.querySelector('.reader-context'), 'Conversation search replaces the One of your people label');
+  searchConversation('book pile');
+  assert(documentInFrame.querySelector('[data-chat-message]').classList.contains('outgoing')
+    && documentInFrame.activeElement.id === 'conversation-search', 'Desktop conversation search filters messages and retains typing focus');
+  searchConversation('fireplace');
+  frame.style.width = '390px';
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert(documentInFrame.querySelectorAll('[data-chat-message]').length === 1
+    && documentInFrame.querySelector('#conversation-search').value === 'fireplace', 'Mobile search is restored when returning from desktop width');
+  click('[data-action="back"]');
+  assert(visible(documentInFrame.querySelector('.message-list')) && !documentInFrame.querySelector('.chat-reader'),
+    'Chat back button returns to the filtered conversation list');
+  assert(visible(documentInFrame.querySelector('.topbar')) && visible(documentInFrame.querySelector('.sender-tabs')),
+    'Leaving a mobile conversation restores mailbox search, Sync, and sender tabs');
+  click('[data-message="m2"]');
+  assert(documentInFrame.querySelector('#conversation-search').value === '', 'A different conversation has an independent search');
+  click('[data-action="back"]');
+  click('[data-message="m1"]');
+  assert(documentInFrame.querySelector('#conversation-search').value === 'fireplace', 'Returning to a conversation preserves its search in this tab');
+  click('[data-action="clear-conversation-search"]');
+  assert(documentInFrame.querySelectorAll('[data-chat-message]').length === 2
+    && documentInFrame.querySelector('#conversation-search').value === '', 'Clear restores all conversation messages');
+  click('[data-action="back"]');
+  click('[data-action="show-folders"]');
+  chooseFolder('contacts');
+  assert(visible(documentInFrame.querySelector('.contacts-page')) && !visible(documentInFrame.querySelector('.sidebar')),
+    'Mobile Contacts link opens the address book');
+  click('[data-action="show-folders"]');
+  assert(visible(documentInFrame.querySelector('.sidebar')), 'Contacts has a route back to folder selection');
+  assert(documentInFrame.documentElement.scrollWidth <= windowInFrame.innerWidth, 'Mobile navigation has no horizontal overflow');
+  frame.style.width = '1200px';
+  await new Promise(resolve => setTimeout(resolve, 80));
+  chooseFolder('inbox');
+  click('[data-message="m1"]');
   const saved = () => JSON.parse(frame.contentWindow.localStorage.getItem('gather-demo-v1'));
   const bubbles = () => documentInFrame.querySelectorAll('[data-chat-message]').length;
   const fill = (text) => {
@@ -40,6 +223,16 @@ try {
   };
   const saveButton = () => documentInFrame.querySelector('#chat-reply-form [type="submit"]');
   assert(Boolean(saveButton()), 'Chat and Save reply button render');
+  fill('A draft to keep when returning home.');
+  click('a[data-home]');
+  assert(documentInFrame.querySelector('#app').dataset.stage === 'home'
+    && documentInFrame.activeElement.id === 'welcome-title', 'Logo returns home and moves keyboard focus to the welcome heading');
+  click('[data-action="enter-demo"]');
+  chooseFolder('inbox');
+  click('[data-message="m1"]');
+  assert(documentInFrame.querySelector('#chat-reply').value === 'A draft to keep when returning home.',
+    'Returning home preserves unsent conversation drafts in memory');
+  fill('');
   const initialCount = bubbles();
   const originalForm = documentInFrame.querySelector('#chat-reply-form');
   saveButton().click();
@@ -63,32 +256,19 @@ try {
   saveButton().querySelector('svg').dispatchEvent(new frame.contentWindow.MouseEvent('click', { bubbles: true, cancelable: true }));
   assert(bubbles() === initialCount + 2, 'Clicking the nested send icon submits exactly once');
   assert(saved().messages.at(-1).body === 'Reply saved by clicking the button icon.', 'Icon click persists the reply');
-  documentInFrame.querySelector('[data-action="back"]').click();
-  documentInFrame.querySelector('[data-folder="sent"]').click();
-  documentInFrame.querySelector('.message-card').click();
+  click('[data-action="back"]');
+  chooseFolder('sent');
+  click('.message-card');
   assert(bubbles() === initialCount + 2, 'Clicked replies appear in the same conversation from Sent');
   const demoBefore = JSON.stringify(saved());
-  const windowInFrame = frame.contentWindow;
-  const waitFor = async (check) => {
-    for (let attempt = 0; attempt < 100; attempt++) {
-      if (check()) return;
-      await new Promise((resolve) => setTimeout(resolve, 30));
-    }
-    throw new Error('Timed out waiting for UI update');
-  };
-  const click = (selector) => {
-    const element = documentInFrame.querySelector(selector);
-    if (!element) throw new Error(`Missing ${selector}`);
-    element.click();
-  };
   const chooseFormat = (format, allowImages = false) => {
     const previousConfirm = windowInFrame.confirm;
     windowInFrame.confirm = () => allowImages;
     click(`[data-action="conversation-format"][data-format="${format}"]`);
     windowInFrame.confirm = previousConfirm;
   };
-  click('[data-action="real-mode"]');
-  await waitFor(() => documentInFrame.querySelector('.real-status'));
+  chooseMode('real');
+  await waitFor(() => documentInFrame.querySelector('#account-select').disabled);
   assert(!documentInFrame.querySelector('.message-card'), 'Real mode starts empty rather than displaying demo mail');
   click('[data-action="connections"]');
   await waitFor(() => documentInFrame.querySelector('#connection-target').textContent);
@@ -227,13 +407,9 @@ try {
   const contactsLink = documentInFrame.querySelector('[data-folder="contacts"]');
   assert(Boolean(folderTree.compareDocumentPosition(contactsLink) & windowInFrame.Node.DOCUMENT_POSITION_FOLLOWING),
     'Folder tree appears before Contacts in the sidebar');
-  assert([...documentInFrame.querySelectorAll('[data-toggle-folder-account]')].every(button => button.getAttribute('aria-expanded') === 'false'),
-    'Every imported account starts collapsed');
-  assert(folderButton('Inbox').getClientRects().length === 0, 'Collapsed account hides its folder list');
-  click('[data-toggle-folder-account]');
-  assert(documentInFrame.querySelector('[data-toggle-folder-account]').getAttribute('aria-expanded') === 'true'
-    && folderButton('Inbox').getClientRects().length > 0, 'Account chevron reveals top-level folders');
-  assert(documentInFrame.activeElement.matches('[data-toggle-folder-account]'), 'Account toggle retains keyboard focus after rendering');
+  assert(!documentInFrame.querySelector('[data-toggle-folder-account]'), 'Current-account tree no longer needs a second account-expansion control');
+  assert(documentInFrame.querySelector('#account-select').value === 'gmail:real-user@example.com'
+    && folderButton('Inbox').getClientRects().length > 0, 'Connected account is selected and its top-level folders are visible');
   assert(['Inbox', 'Sent', 'Drafts', 'Spam', 'Trash', 'Projects', 'Projects/Client <team>', 'Empty folder'].every(path => folderButton(path)),
     'All provider labels, nested labels, drafts, spam, trash, and empty folders appear');
   assert(folderButton('Projects/Client <team>').closest('.provider-folder-row').style.getPropertyValue('--folder-depth') === '1', 'Nested label is indented under its parent');
@@ -244,17 +420,17 @@ try {
   assert(documentInFrame.activeElement.matches('[data-toggle-provider-folder]'), 'Nested toggle retains keyboard focus');
   assert(folderButton('Inbox').querySelector('.provider-folder-count').textContent === '1', 'Folder badge counts cached matching messages');
   folderButton('Projects/Client <team>').click();
-  assert(documentInFrame.querySelector('.breadcrumb strong').textContent === 'Projects/Client <team>', 'Custom folder title is escaped and shown in breadcrumb');
+  assert(documentInFrame.querySelector('.current-folder-label').textContent === 'Projects/Client <team>', 'Custom folder title is escaped and shown above the list');
   assert(documentInFrame.querySelectorAll('.message-card').length === 1, 'Selecting a custom label filters by actual provider membership');
   assert(documentInFrame.querySelector('[data-provider-folder][aria-current="page"]').title === 'Projects/Client <team>', 'Selected provider label is highlighted');
   toggleProject();
   assert(folderButton('Projects/Client <team>').getClientRects().length === 0, 'Parent chevron collapses its descendants');
-  assert(documentInFrame.querySelector('.breadcrumb strong').textContent === 'Projects/Client <team>'
+  assert(documentInFrame.querySelector('.current-folder-label').textContent === 'Projects/Client <team>'
     && documentInFrame.querySelectorAll('.message-card').length === 1, 'Collapsing a branch preserves the current folder selection and messages');
   toggleProject();
-  click('[data-toggle-folder-account]');
-  assert(folderButton('Projects').getClientRects().length === 0, 'Account chevron collapses the entire folder tree');
-  click('[data-toggle-folder-account]');
+  documentInFrame.querySelector('.provider-folders summary').click();
+  assert(!documentInFrame.querySelector('.provider-folders').open && !visible(folderButton('Projects')), 'Folder summary collapses the tree');
+  documentInFrame.querySelector('.provider-folders summary').click();
   assert(folderButton('Projects/Client <team>').getClientRects().length > 0, 'Reopening an account preserves expanded nested branches');
   click('[data-folder="contacts"]');
   assert(folderButton('Projects/Client <team>').getClientRects().length > 0, 'Tree expansion survives navigation to Contacts');
@@ -263,24 +439,38 @@ try {
   assert(bubbles() === 2, 'Custom label opens the complete received and sent thread');
   click('[data-action="back"]');
   folderButton('Drafts').click();
+  click('[data-audience="unknown"]');
   click('.message-card');
   assert(documentInFrame.querySelector('.chat-message-footer').textContent.includes('Draft · Not sent'), 'Draft is explicitly marked not sent');
   assert(documentInFrame.querySelector('.chat-person').textContent.includes('Draft without recipient'), 'Recipient-less drafts remain readable');
   assert(!documentInFrame.querySelector('#chat-reply-form'), 'Draft view cannot send or modify provider drafts');
   click('[data-action="back"]');
   folderButton('Spam').click();
+  click('[data-audience="contacts"]');
   assert(documentInFrame.querySelector('.message-card').textContent.includes('spam message'), 'Spam label displays its synced mail');
   folderButton('Trash').click();
   assert(documentInFrame.querySelector('.message-card').textContent.includes('trash message'), 'Trash label displays its synced mail');
   folderButton('Empty folder').click();
   assert(!documentInFrame.querySelector('.message-card') && documentInFrame.querySelector('.empty-state'), 'Empty provider folders remain selectable');
-  click('[data-folder="inbox"]');
+  chooseFolder('inbox');
   assert(documentInFrame.querySelectorAll('.message-card').length === 1, 'Imported inbox groups received and sent mail by provider thread');
   click('.message-card');
   assert(bubbles() === 2, 'Real conversation displays imported received and sent messages');
   assert(!documentInFrame.querySelector('.html-message')
     && documentInFrame.querySelector('[data-format="plain"]').getAttribute('aria-pressed') === 'true',
     'Conversations open as plain text by default, without mounting HTML or requesting images');
+  frame.style.width = '390px';
+  await new Promise(resolve => setTimeout(resolve, 80));
+  searchConversation('Oldest quoted content');
+  assert(documentInFrame.querySelectorAll('[data-chat-message]').length === 1
+    && documentInFrame.querySelector('.incoming .message-body').textContent.includes('Oldest quoted content')
+    && documentInFrame.querySelector('.quote-search-note'),
+    'Conversation search reveals quoted history when needed to show a matching result');
+  click('[data-action="clear-conversation-search"]');
+  assert(!documentInFrame.querySelector('.incoming .message-body').textContent.includes('Oldest quoted content'),
+    'Clearing conversation search restores the previous collapsed quote state');
+  frame.style.width = '1200px';
+  await new Promise(resolve => setTimeout(resolve, 80));
   let formatPrompts = [];
   const initialConfirm = windowInFrame.confirm;
   const requestsBeforeHtml = requests.length;
@@ -315,7 +505,8 @@ try {
   click('[data-action="toggle-quotes"]');
   assert(!documentInFrame.querySelector('.incoming .message-body').textContent.includes('Earlier quoted content'), 'Collapsing hides history in plain-text mode');
   chooseFormat('html');
-  await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.querySelector('strong'));
+  await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.querySelector('strong')
+    && documentInFrame.querySelector('.html-message').style.height);
   htmlFrame = documentInFrame.querySelector('.html-message');
   assert(!htmlFrame.contentDocument.body.textContent.includes('Earlier quoted content'), 'Collapsed history stays hidden after switching back to HTML');
   assert(htmlFrame.sandbox.value === 'allow-same-origin', 'HTML frame cannot run scripts, forms, or navigate the app');
@@ -368,8 +559,8 @@ try {
   delayImage = false;
   click('[data-action="load-images"]');
   await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.querySelectorAll('img').length === 2);
-  click('[data-action="demo-mode"]');
-  click('[data-action="real-mode"]');
+  chooseMode('demo');
+  chooseMode('real');
   await waitFor(() => documentInFrame.querySelector('.message-card'));
   click('.message-card');
   await waitFor(() => documentInFrame.querySelector('.html-message')?.contentDocument?.body?.textContent.includes('Image blocked'));
@@ -380,11 +571,13 @@ try {
     'Plain-text toggle shows the searchable fallback without HTML');
   click('[data-action="back"]');
   folderButton('Drafts').click();
+  click('[data-audience="unknown"]');
   click('.message-card');
   assert(documentInFrame.querySelector('[data-format="plain"]').getAttribute('aria-pressed') === 'true',
     'Other conversations retain their default plain-text format');
   click('[data-action="back"]');
-  click('[data-folder="inbox"]');
+  chooseFolder('inbox');
+  click('[data-audience="contacts"]');
   click('.message-card');
   assert(!documentInFrame.querySelector('.html-message')
     && documentInFrame.querySelector('[data-format="plain"]').getAttribute('aria-pressed') === 'true',
@@ -448,14 +641,14 @@ try {
   folderRenamed = true;
   click('[data-action="sync"]');
   await waitFor(() => folderButton('Projects/Renamed <team>') && !documentInFrame.querySelector('[data-action="sync"]').disabled);
-  assert(documentInFrame.querySelector('.breadcrumb strong').textContent === 'Projects/Renamed <team>', 'Folder rename sync preserves selection by stable provider ID');
+  assert(documentInFrame.querySelector('.current-folder-label').textContent === 'Projects/Renamed <team>', 'Folder rename sync preserves selection by stable provider ID');
   assert(folderButton('Projects/Renamed <team>').getClientRects().length > 0
-    && documentInFrame.querySelector('[data-toggle-folder-account]').getAttribute('aria-expanded') === 'true',
-    'Account and branch expansion survive a folder rename and sync');
+    && documentInFrame.querySelector('.provider-folders').open,
+    'Tree and branch expansion survive a folder rename and sync');
   folderRemoved = true;
   click('[data-action="sync"]');
   await waitFor(() => !folderButton('Projects/Renamed <team>') && !documentInFrame.querySelector('[data-action="sync"]').disabled);
-  assert(documentInFrame.querySelector('[data-folder="inbox"]').getAttribute('aria-current') === 'page', 'Deleted folder is removed and selection safely returns to Inbox');
+  assert(documentInFrame.querySelector('.current-folder-label').textContent === 'Inbox', 'Deleted folder is removed and selection safely returns to Inbox');
   assert(!folderButton('Projects/Renamed <team>'), 'Removed provider labels do not remain in the sidebar');
   frame.style.width = '390px';
   await new Promise(resolve => setTimeout(resolve, 80));
@@ -493,7 +686,7 @@ try {
   assert(documentInFrame.querySelectorAll('.connected-account').length === 1, 'Cancelled replacement import preserves the existing cached account');
   cancelAtMail = false;
   click('#close-accounts');
-  click('[data-folder="inbox"]');
+  chooseFolder('inbox');
   click('.message-card');
   const sendConfirm = windowInFrame.confirm;
   const countBeforeSending = bubbles();
@@ -517,6 +710,8 @@ try {
   saveButton().click();
   await waitFor(() => Boolean(releaseSend));
   const inFlightCalls = sendCalls;
+  click('a[data-home]');
+  assert(!documentInFrame.querySelector('.welcome-screen'), 'Home navigation does not interrupt an in-flight real send');
   documentInFrame.querySelector('#chat-reply-form').requestSubmit();
   assert(sendCalls === inFlightCalls && documentInFrame.querySelector('#chat-reply-form [type="submit"]').disabled,
     'Duplicate submit while sending cannot send a second email');
@@ -528,7 +723,7 @@ try {
   assert(documentInFrame.querySelectorAll('.html-message').length === 2
     && documentInFrame.querySelector('.chat-message:last-child .message-body').textContent === 'A real reply from Gather.',
     'HTML conversation mode preserves readability of newly sent plain-text messages');
-  assert(documentInFrame.querySelector('[data-folder="inbox"]').getAttribute('aria-current') === 'page',
+  assert(documentInFrame.querySelector('.current-folder-label').textContent === 'Inbox',
     'Real reply does not navigate away from inbox');
   assert(sentCopies[0].threadId === 'actual-thread', 'Real reply sends the existing provider thread ID');
   assert(sentCopies[0].payload.headers.find(header => header.name === 'To').value === 'maya@example.com, teammate@example.com'
@@ -565,7 +760,7 @@ try {
   composeForm.elements.body.value = 'A new email from Gather.';
   composeForm.querySelector('[type="submit"]').click();
   await waitFor(() => !documentInFrame.querySelector('#compose-dialog').open);
-  assert(documentInFrame.querySelector('[data-folder="sent"]').getAttribute('aria-current') === 'page'
+  assert(documentInFrame.querySelector('.current-folder-label').textContent === 'Sent'
     && documentInFrame.querySelector('.subject-heading').textContent === 'A new real conversation',
     'New real email opens in Sent as a new conversation');
   assert(documentInFrame.querySelector('.chat-message').textContent.includes('Accepted by provider'),
@@ -582,8 +777,8 @@ try {
   click('#close-accounts');
   assert(!documentInFrame.querySelector('.contact-tile'), 'Removing local account data removes its imported contacts');
   assert(!documentInFrame.querySelector('[data-action="sync"]').disabled, 'Account removal releases the busy state so sync stays usable');
-  click('[data-action="demo-mode"]');
-  assert(documentInFrame.querySelectorAll('.message-card').length === 7, 'Switching back restores the demo inbox');
+  chooseMode('demo');
+  assert(documentInFrame.querySelectorAll('.message-card').length === 5, 'Switching back restores the selected demo account inbox');
   assert(JSON.stringify(saved()) === demoBefore, 'Connection, failed sync, cancellation, and removal leave demo data unchanged');
   click('[data-message="m5"]');
   formatPrompts = [];
@@ -632,7 +827,7 @@ try {
     assert(list.scrollHeight <= list.clientHeight + 1 && windowInFrame.getComputedStyle(list).overflowY === 'visible',
       `${width}px topic list displays fully without an internal scrollbar`);
     click('[data-message="m1"]');
-    click('[data-message="m3"]');
+    click('[data-message="m4"]');
     const shortReply = documentInFrame.querySelector('#chat-reply-form');
     const shortMessage = documentInFrame.querySelector('.chat-message:last-child');
     assert(shortReply.getBoundingClientRect().top - shortMessage.getBoundingClientRect().bottom <= 24,
@@ -641,6 +836,9 @@ try {
   }
   await checkFullHeight(1200);
   await checkFullHeight(390);
+  await checkFullHeight(320);
+  assert(documentInFrame.querySelector('.chat-person > div:not(.conversation-format)').getBoundingClientRect().width >= 110,
+    'Narrow-screen correspondent details remain readable instead of being squeezed into a vertical column');
 } catch (error) {
   if (!results.some((result) => !result.passed)) {
     const doc = document.querySelector('#preview')?.contentDocument;
