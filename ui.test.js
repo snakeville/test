@@ -286,10 +286,16 @@ try {
   const imageData = imageCanvas.toDataURL('image/png');
   const requests = [];
   const sentCopies = [];
+  const createdContacts = [];
+  const conversationChanges = new Map();
+  let actionCalls = 0, rejectAction = false, uncertainContact = false, writeGrants = false;
+  let readCalls = 0, rejectRead = false;
+  const readThreads = new Set();
   let sendScenario = 'success', sendCalls = 0, releaseSend;
   const decodeMime = value => new TextDecoder().decode(Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), character => character.charCodeAt(0)));
   windowInFrame.google = { accounts: { oauth2: {
-    hasGrantedAllScopes: () => !partialConsent,
+    hasGrantedAllScopes: (_response, ...scopes) => !partialConsent
+      && (writeGrants || scopes.every(scope => !scope.endsWith('/gmail.modify') && !scope.endsWith('/contacts'))),
     initTokenClient: (options) => ({ requestAccessToken: () => options.callback({
       access_token: 'ui-test-token', expires_in: 3600,
     }) }),
@@ -300,6 +306,31 @@ try {
     if (!['gmail.googleapis.com', 'people.googleapis.com'].includes(url.hostname)) return originalFetch(input, options);
     requests.push({ url: url.href, method: options.method });
     if (options.method === 'POST') {
+      if (url.pathname.includes('/threads/')) {
+        if (JSON.parse(options.body || '{}').removeLabelIds?.includes('UNREAD')) {
+          readCalls++;
+          if (rejectRead) return new Response('{}', { status: 403 });
+          readThreads.add(decodeURIComponent(url.pathname.split('/').at(-2)));
+          return new Response('{}');
+        }
+        actionCalls++;
+        if (rejectAction) return new Response('{}', { status: 403 });
+        const parts = url.pathname.split('/');
+        const thread = decodeURIComponent(parts.at(-2));
+        const action = parts.at(-1);
+        if (!['trash', 'modify'].includes(action)) throw new Error('Unexpected conversation mutation');
+        if (action === 'modify') assert(JSON.parse(options.body).removeLabelIds.join() === 'INBOX', 'Archive removes only the Inbox label');
+        conversationChanges.set(thread, action === 'trash' ? 'trash' : 'archive');
+        return new Response('{}');
+      }
+      if (url.pathname === '/v1/people:createContact') {
+        actionCalls++;
+        if (uncertainContact) throw new TypeError('Contact creation response lost');
+        const body = JSON.parse(options.body);
+        const contact = { resourceName: `people/added-${createdContacts.length}`, names: [{ displayName: body.names[0].unstructuredName }], emailAddresses: body.emailAddresses };
+        createdContacts.push(contact);
+        return new Response(JSON.stringify(contact));
+      }
       sendCalls++;
       if (!url.pathname.endsWith('/messages/send')) throw new Error('Unexpected mutation endpoint');
       if (sendScenario === 'reject') return new Response('{}', { status: 403 });
@@ -344,9 +375,18 @@ try {
         click('#cancel-import');
         throw new DOMException('Cancelled', 'AbortError');
       }
-      return new Response(JSON.stringify({ messages: [...['real-1', 'real-2', 'draft', 'spam', 'trash'].map(id => ({ id })), ...sentCopies.map(message => ({ id: message.id }))] }));
+      return new Response(JSON.stringify({ messages: [...['real-1', 'real-2', 'draft', 'spam', 'trash', 'new-sender'].map(id => ({ id })), ...sentCopies.map(message => ({ id: message.id }))] }));
     }
-    if (url.pathname.endsWith('/history')) return new Response(JSON.stringify({ history: [{ messages: sentCopies.map(message => ({ id: message.id })) }], historyId: '101' }));
+    if (url.pathname.endsWith('/history')) return new Response(JSON.stringify({ history: [{ messages: [...sentCopies.map(message => ({ id: message.id })), { id: 'new-sender' }] }], historyId: '101' }));
+    if (url.pathname.includes('/threads/')) {
+      const threadId = decodeURIComponent(url.pathname.split('/').at(-1));
+      if (threadId === 'actual-thread') return new Response(JSON.stringify({ messages: [
+        { id: 'real-1', labelIds: readThreads.has(threadId) ? ['INBOX'] : ['INBOX', 'UNREAD'] },
+        { id: 'real-2', labelIds: ['SENT'] },
+      ] }));
+      const changed = conversationChanges.get('new-sender-thread');
+      return new Response(JSON.stringify({ messages: [{ id: 'new-sender', labelIds: changed === 'trash' ? ['TRASH'] : changed === 'archive' ? [] : ['INBOX'] }] }));
+    }
     if (url.pathname.includes('/attachments/')) {
       if (delayImage) return new Promise((resolve, reject) => options.signal.addEventListener('abort',
         () => reject(new DOMException('Cancelled', 'AbortError')), { once: true }));
@@ -354,6 +394,17 @@ try {
     }
     if (url.pathname.includes('/messages/')) {
       const special = url.pathname.split('/').at(-1);
+      if (special === 'new-sender') {
+        const changed = conversationChanges.get('new-sender-thread');
+        return new Response(JSON.stringify({
+          id: 'new-sender', threadId: 'new-sender-thread', internalDate: String(Date.now() - 5000),
+          labelIds: changed === 'trash' ? ['TRASH', 'projects'] : changed === 'archive' ? ['projects'] : ['INBOX', 'projects'],
+          payload: { mimeType: 'text/plain', body: { data: btoa('A conversation from a new sender.') }, headers: [
+            { name: 'From', value: 'New Person <new-person@example.com>' }, { name: 'To', value: 'real-user@example.com' },
+            { name: 'Subject', value: 'New sender conversation' }, { name: 'Message-ID', value: '<new-sender@example.com>' },
+          ] },
+        }));
+      }
       const sentCopy = sentCopies.find(message => message.id === special);
       if (sentCopy) return new Response(JSON.stringify(sentCopy));
       if (['draft', 'spam', 'trash'].includes(special)) return new Response(JSON.stringify({
@@ -368,7 +419,7 @@ try {
       const body = btoa(sent ? `<p>An actual <em>sent</em> message, imported.</p><img src="${imageData}" alt="Sent image">` : `<h2>Provider HTML</h2><p>A private <strong>imported</strong> message.</p><a href="https://example.test/message">Read more</a><img src="${imageData}" alt="Embedded data image"><img src="cid:logo" alt="Provider image"><div class="protonmail_quote">-------- Original Message --------<blockquote>Earlier quoted content<div class="gmail_quote">Oldest quoted content</div></blockquote></div>`);
       return new Response(JSON.stringify({
         id: sent ? 'real-2' : 'real-1', threadId: 'actual-thread',
-        labelIds: sent ? ['SENT'] : ['INBOX', 'UNREAD', 'projects', 'nested'], internalDate: String(Date.now() - (sent ? 1000 : 2000)),
+        labelIds: sent ? ['SENT'] : ['INBOX', ...(readThreads.has('actual-thread') ? [] : ['UNREAD']), 'projects', 'nested'], internalDate: String(Date.now() - (sent ? 1000 : 2000)),
         payload: { mimeType: 'text/html', body: { data: body }, parts: sent ? [] : [
           { mimeType: 'image/png', headers: [{ name: 'Content-ID', value: '<logo>' }], body: { attachmentId: 'image1', size: 1000 }, filename: 'logo.png' },
         ], headers: [
@@ -383,7 +434,7 @@ try {
     if (url.hostname === 'people.googleapis.com') return failContacts ? new Response(JSON.stringify({
       error: { status: 'PERMISSION_DENIED', details: [{ reason: 'SERVICE_DISABLED' }], message: 'PRIVATE_DIAGNOSTIC' },
     }), { status: 403 })
-      : new Response(JSON.stringify({ connections: [{ resourceName: 'people/1', names: [{ displayName: 'Maya' }], emailAddresses: [{ value: 'maya@example.com' }] }] }));
+      : new Response(JSON.stringify({ connections: [{ resourceName: 'people/1', names: [{ displayName: 'Maya' }], emailAddresses: [{ value: 'maya@example.com' }] }, ...createdContacts] }));
     throw new Error(`Unexpected API URL ${url}`);
   };
   form.elements.clientId.value = '123-test.apps.googleusercontent.com';
@@ -418,7 +469,7 @@ try {
   toggleProject();
   assert(folderButton('Projects/Client <team>').getClientRects().length > 0, 'Parent chevron reveals nested folders');
   assert(documentInFrame.activeElement.matches('[data-toggle-provider-folder]'), 'Nested toggle retains keyboard focus');
-  assert(folderButton('Inbox').querySelector('.provider-folder-count').textContent === '1', 'Folder badge counts cached matching messages');
+  assert(folderButton('Inbox').querySelector('.provider-folder-count').textContent === '2', 'Folder badge counts cached messages from both known and unknown senders');
   folderButton('Projects/Client <team>').click();
   assert(documentInFrame.querySelector('.current-folder-label').textContent === 'Projects/Client <team>', 'Custom folder title is escaped and shown above the list');
   assert(documentInFrame.querySelectorAll('.message-card').length === 1, 'Selecting a custom label filters by actual provider membership');
@@ -456,11 +507,21 @@ try {
   assert(documentInFrame.querySelectorAll('.message-card').length === 1, 'Imported inbox groups received and sent mail by provider thread');
   click('.message-card');
   assert(bubbles() === 2, 'Real conversation displays imported received and sent messages');
+  assert(documentInFrame.querySelector('[data-action="archive-conversation"]').disabled
+    && documentInFrame.querySelector('[data-action="trash-conversation"]').disabled
+    && documentInFrame.querySelector('.action-help').textContent.includes('Reconnect'),
+    'Read/send-only accounts explain the additional permission needed for conversation actions');
   assert(!documentInFrame.querySelector('.html-message')
     && documentInFrame.querySelector('[data-format="plain"]').getAttribute('aria-pressed') === 'true',
     'Conversations open as plain text by default, without mounting HTML or requesting images');
   frame.style.width = '390px';
   await new Promise(resolve => setTimeout(resolve, 80));
+  assert(readCalls === 0, 'Opening without mail-write permission makes no provider write');
+  assert(documentInFrame.querySelector('.chat-message-footer').textContent.includes('Unread'),
+    'Opening without mail-write permission preserves unread state');
+  await waitFor(() => documentInFrame.querySelector('.real-status').textContent.includes('Could not mark'));
+  assert(documentInFrame.querySelector('.real-status').textContent.includes('Reconnect'),
+    'Opening without mail-write permission explains how to reconnect');
   searchConversation('Oldest quoted content');
   assert(documentInFrame.querySelectorAll('[data-chat-message]').length === 1
     && documentInFrame.querySelector('.incoming .message-body').textContent.includes('Oldest quoted content')
@@ -678,6 +739,7 @@ try {
   click('[data-reconnect]');
   form.elements.days.value = '7';
   form.elements.days.dispatchEvent(new windowInFrame.Event('change', { bubbles: true }));
+  writeGrants = true;
   click('#prepare-provider');
   await waitFor(() => !documentInFrame.querySelector('#connect-provider').hidden);
   cancelAtMail = true;
@@ -687,7 +749,42 @@ try {
   cancelAtMail = false;
   click('#close-accounts');
   chooseFolder('inbox');
+  rejectRead = true;
+  click('[data-action="unread-filter"]');
   click('.message-card');
+  await waitFor(() => documentInFrame.querySelector('.real-status').textContent.includes('Could not mark')
+    && !documentInFrame.querySelector('[data-action="sync"]').disabled);
+  assert(readCalls === 1 && documentInFrame.querySelector('.message-card.selected').classList.contains('unread'),
+    'A rejected read update leaves the conversation unread and visible');
+  rejectRead = false;
+  click('[data-action="sync"]');
+  click('.message-card.selected');
+  assert(readCalls === 1, 'Opening during sync queues the read update rather than competing with the import');
+  await waitFor(() => readThreads.has('actual-thread') && !documentInFrame.querySelector('[data-action="sync"]').disabled);
+  assert(!documentInFrame.querySelector('.message-card.unread')
+    && !documentInFrame.querySelector('.chat-message-footer').textContent.includes('Unread')
+    && documentInFrame.querySelector('.chat-reader')
+    && documentInFrame.querySelector('[data-action="unread-filter"]').getAttribute('aria-pressed') === 'true',
+    'Opening a real conversation marks all its messages read and keeps the reader open with the Unread filter enabled');
+  const persistedRead = await new Promise((resolve, reject) => {
+    const request = indexedDB.open(testDatabase);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const database = request.result;
+      const transaction = database.transaction('accounts');
+      const records = transaction.objectStore('accounts').getAll();
+      records.onsuccess = () => resolve(records.result[0].messages.find(message => message.remoteId === 'real-1').unread);
+      records.onerror = () => reject(records.error);
+      transaction.oncomplete = () => database.close();
+      transaction.onabort = () => database.close();
+    };
+  });
+  assert(persistedRead === false, 'Confirmed read status is persisted in the real mailbox cache');
+  const readsAfterOpen = readCalls;
+  click('[data-action="unread-filter"]');
+  click('.message-card');
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert(readCalls === readsAfterOpen, 'Reopening an already-read conversation makes no redundant provider write');
   const sendConfirm = windowInFrame.confirm;
   const countBeforeSending = bubbles();
   const replyLabel = documentInFrame.querySelector('label[for="chat-reply"]').textContent;
@@ -766,6 +863,69 @@ try {
   assert(documentInFrame.querySelector('.chat-message').textContent.includes('Accepted by provider'),
     'New email is labeled provider-accepted, not delivered');
   assert(JSON.stringify(saved()) === demoBefore, 'Real sending never writes into demo localStorage');
+  click('[data-action="back"]');
+  chooseFolder('inbox');
+  click('[data-audience="unknown"]');
+  click('[data-message="gmail:real-user@example.com:new-sender"]');
+  assert(documentInFrame.querySelector('[data-action="add-conversation-sender"]')
+    && !documentInFrame.querySelector('[data-action="archive-conversation"]').disabled,
+    'Conversation header exposes provider contact, archive, and trash actions');
+  click('[data-action="add-conversation-sender"]');
+  assert(documentInFrame.querySelector('#sender-form [name="sender"]').value === 'new-person@example.com',
+    'Add sender dialog uses the actual received sender');
+  documentInFrame.querySelector('#sender-form [name="name"]').value = 'New Friend';
+  uncertainContact = true;
+  documentInFrame.querySelector('#sender-form [type="submit"]').click();
+  await waitFor(() => documentInFrame.querySelector('#sender-form .form-error').textContent.includes('could not be confirmed'));
+  const afterUncertainContact = actionCalls;
+  documentInFrame.querySelector('#sender-form [type="submit"]').click();
+  await waitFor(() => documentInFrame.querySelector('#sender-form .form-error').textContent.includes('unconfirmed result'));
+  assert(actionCalls === afterUncertainContact, 'Uncertain contact creation is not automatically or manually duplicated without resolution');
+  click('#sender-form [data-close]');
+  click('[data-action="connections"]');
+  await waitFor(() => documentInFrame.querySelector('[data-clear-contact-attempt]') && !documentInFrame.querySelector('[data-clear-contact-attempt]').disabled);
+  click('[data-clear-contact-attempt]');
+  await waitFor(() => !documentInFrame.querySelector('[data-clear-contact-attempt]'));
+  assert(actionCalls === afterUncertainContact, 'Clearing a checked contact attempt only changes local recovery state');
+  click('#close-accounts');
+  uncertainContact = false;
+  click('[data-action="add-conversation-sender"]');
+  documentInFrame.querySelector('#sender-form [name="name"]').value = 'New Friend';
+  documentInFrame.querySelector('#sender-form [type="submit"]').click();
+  await waitFor(() => !documentInFrame.querySelector('#sender-dialog').open);
+  assert(createdContacts.length === 1 && createdContacts[0].emailAddresses[0].value === 'new-person@example.com',
+    'Adding a sender creates the contact at the provider');
+  assert(documentInFrame.querySelector('[data-audience="contacts"]').getAttribute('aria-selected') === 'true'
+    && documentInFrame.querySelector('.chat-person').textContent.includes('New Friend'),
+    'Provider contact creation immediately reclassifies the current conversation under Contacts');
+  assert(!documentInFrame.querySelector('[data-action="add-conversation-sender"]'), 'Known senders do not get a duplicate add-contact action');
+  const beforeCancelAction = actionCalls;
+  windowInFrame.confirm = () => false;
+  click('[data-action="trash-conversation"]');
+  assert(actionCalls === beforeCancelAction, 'Declining Trash confirmation performs no mutation');
+  windowInFrame.confirm = () => true;
+  rejectAction = true;
+  click('[data-action="archive-conversation"]');
+  await waitFor(() => documentInFrame.querySelector('.real-status.storage-error')?.textContent.includes('403')
+    && !documentInFrame.querySelector('[data-action="sync"]').disabled);
+  assert(documentInFrame.querySelector('.chat-reader'), 'Rejected archive keeps the conversation visible and shows an error');
+  rejectAction = false;
+  failContacts = true;
+  click('[data-action="archive-conversation"]');
+  await waitFor(() => !documentInFrame.querySelector('.chat-reader') && !documentInFrame.querySelector('[data-action="sync"]').disabled);
+  assert(conversationChanges.get('new-sender-thread') === 'archive', 'Archive updates Gmail and removes the conversation from Inbox');
+  assert(documentInFrame.querySelector('.real-status.storage-error').textContent.includes('Refresh failed'),
+    'A successful provider action followed by refresh failure is reported explicitly');
+  failContacts = false;
+  folderButton('Projects').click();
+  click('[data-message="gmail:real-user@example.com:new-sender"]');
+  click('[data-action="trash-conversation"]');
+  await waitFor(() => !documentInFrame.querySelector('[data-action="sync"]').disabled && conversationChanges.get('new-sender-thread') === 'trash');
+  folderButton('Trash').click();
+  click('[data-message="gmail:real-user@example.com:new-sender"]');
+  assert(documentInFrame.querySelector('.chat-message-footer').textContent.includes('Deleted / Trash'),
+    'Deleted conversation remains readable in provider Trash instead of being permanently removed');
+  assert(JSON.stringify(saved()) === demoBefore, 'Provider contact and conversation actions do not alter demo data');
   windowInFrame.confirm = sendConfirm;
   click('[data-action="connections"]');
   await waitFor(() => documentInFrame.querySelector('[data-remove-account]') && !documentInFrame.querySelector('[data-remove-account]').disabled);
@@ -839,6 +999,60 @@ try {
   await checkFullHeight(320);
   assert(documentInFrame.querySelector('.chat-person > div:not(.conversation-format)').getBoundingClientRect().width >= 110,
     'Narrow-screen correspondent details remain readable instead of being squeezed into a vertical column');
+  const demoConfirm = windowInFrame.confirm;
+  windowInFrame.confirm = () => true;
+  click('[data-action="archive-conversation"]');
+  assert(saved().messages.find(message => message.id === 'm1').folder === 'archive',
+    'Demo conversation archive moves received mail locally');
+  assert(saved().messages.find(message => message.id === 'demo-reply-m1').folder === 'sent',
+    'Demo archive preserves sent replies');
+  chooseFolder('archive');
+  click('.message-card');
+  click('[data-action="trash-conversation"]');
+  chooseFolder('trash');
+  click('.message-card');
+  assert([...documentInFrame.querySelectorAll('.chat-message-footer')].every(element => !element.textContent.includes('Archived')),
+    'Demo Trash keeps the conversation readable after moving all its messages');
+  assert(saved().messages.filter(message => message.subject.includes('getaway')).every(message => message.folder === 'trash'),
+    'Demo Trash action covers the entire topic rather than only visible search results');
+  chooseFolder('inbox');
+  click('[data-audience="unknown"]');
+  click('.message-card');
+  assert([...documentInFrame.querySelectorAll('.conversation-actions button')].every(button => {
+    const bounds = button.getBoundingClientRect();
+    return bounds.left >= 0 && bounds.right <= windowInFrame.innerWidth && bounds.height >= 40;
+  }), 'All three conversation actions fit the narrow mobile layout with usable tap targets');
+  click('[data-action="add-conversation-sender"]');
+  const demoContactForm = documentInFrame.querySelector('#contact-form');
+  assert(documentInFrame.querySelector('#contact-dialog').open
+    && !documentInFrame.querySelector('.contact-target').hidden,
+    'Demo add-sender preserves the choice of a new or existing contact');
+  const senderEmail = demoContactForm.querySelector('[name="email"]').value;
+  const contactsBefore = saved().contacts.length;
+  const target = demoContactForm.elements.target;
+  target.value = target.options[1].value;
+  target.dispatchEvent(new windowInFrame.Event('change', { bubbles: true }));
+  demoContactForm.querySelector('[type="submit"]').click();
+  assert(saved().contacts.length === contactsBefore
+    && saved().contacts.find(contact => contact.id === target.value).emails.includes(senderEmail),
+    'Demo sender can be added to an existing contact without creating a duplicate');
+  assert(documentInFrame.querySelector('[data-audience="contacts"]').getAttribute('aria-selected') === 'true'
+    && documentInFrame.querySelector('.chat-reader'),
+    'Adding a demo sender keeps the conversation open under Contacts');
+  windowInFrame.confirm = demoConfirm;
+  frame.style.width = '1200px';
+  await new Promise(resolve => setTimeout(resolve, 80));
+  click('[data-action="sync"]');
+  const accountPicker = documentInFrame.querySelector('#account-select');
+  accountPicker.focus();
+  await waitFor(() => !documentInFrame.querySelector('[data-action="sync"]').disabled);
+  assert(accountPicker.isConnected && documentInFrame.querySelector('#account-select') === accountPicker
+    && documentInFrame.activeElement === accountPicker,
+    'Desktop account picker remains connected and focused through a background mailbox redraw');
+  changeSelect('#account-select', 'outlook');
+  assert(documentInFrame.querySelector('#account-select').value === 'outlook'
+    && documentInFrame.querySelectorAll('.message-card').length === 2,
+    'Account switching still updates the mailbox after the picker survives a redraw');
 } catch (error) {
   if (!results.some((result) => !result.passed)) {
     const doc = document.querySelector('#preview')?.contentDocument;

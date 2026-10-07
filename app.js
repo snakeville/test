@@ -2,7 +2,8 @@ import { ACCOUNTS as DEMO_ACCOUNTS, createDemo, findContact, visibleConversation
 import { createAccountsPanel } from './accounts-panel.js';
 import { mountHtmlMessages } from './email-html.js';
 import { inlineImageReferences, loadInlineImages } from './email-images.js';
-import { getAccountApi, canSend } from './auth.js';
+import { getAccountApi, canSend, canManageMail, canManageContacts } from './auth.js';
+import { unknownSenders, updateDemoConversation } from './conversation-actions.js';
 import { parseRecipients, replyTarget } from './email-send.js';
 import { messagePlainText, messagePreview } from './email-text.js';
 import { messageQuoteContent } from './email-quotes.js';
@@ -56,6 +57,11 @@ let realStatus = '';
 let realError = false;
 let realBusy = false;
 let sending = false;
+let conversationActionBusy = false;
+const pendingReads = new Map();
+let senderContext = null;
+const senderDialog = document.querySelector('#sender-dialog');
+const senderForm = document.querySelector('#sender-form');
 const replyErrors = new Map();
 const connections = createAccountsPanel({
   onChange: (updated) => {
@@ -88,6 +94,30 @@ const connections = createAccountsPanel({
   },
 });
 
+async function markOpenedConversationsRead() {
+  if (!realMode || homeVisible) { pendingReads.clear(); return; }
+  if (realBusy || sending || conversationActionBusy || !pendingReads.size) return;
+  const [key, opened] = pendingReads.entries().next().value;
+  pendingReads.delete(key);
+  const messages = conversationMessages(realState, opened.messageId);
+  if (!messages.some(message => message.remote && !message.sendState && !message.isDraft && message.unread)) {
+    queueMicrotask(markOpenedConversationsRead);
+    return;
+  }
+  conversationActionBusy = true;
+  try {
+    const result = await connections.actOnConversation(opened.accountId, opened.messageId, 'read');
+    if (result.warning) notify(result.warning);
+  } catch (error) {
+    realStatus = `Could not mark the conversation as read. ${error.message}`;
+    realError = true;
+    notify(realStatus);
+  } finally {
+    conversationActionBusy = false;
+    render();
+  }
+}
+
 const escape = (value = '') => String(value).replace(/[&<>"']/g, (character) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 const icons = {
@@ -116,7 +146,7 @@ const provider = (id) => {
 };
 const time = (date) => new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(date));
 const dateLabel = (date) => new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(new Date(date));
-const labels = { inbox: 'Inbox', unknown: 'Unknown senders', starred: 'Starred', sent: 'Sent', archive: 'Archive', contacts: 'Contacts', outbox: 'Outbox' };
+const labels = { inbox: 'Inbox', unknown: 'Unknown senders', starred: 'Starred', sent: 'Sent', archive: 'Archive', contacts: 'Contacts', outbox: 'Outbox', trash: 'Trash' };
 
 function notify(message) {
   const notice = document.querySelector('#notice');
@@ -200,8 +230,8 @@ function resetAccountView() {
 }
 
 async function switchMode(nextRealMode) {
-  if (syncing || sending) {
-    notify('Wait for the current sync or send to finish before switching mailboxes.');
+  if (syncing || sending || conversationActionBusy) {
+    notify('Wait for the current sync, send, or conversation action to finish before switching mailboxes.');
     render();
     return;
   }
@@ -222,8 +252,8 @@ async function switchMode(nextRealMode) {
 }
 
 function showHome() {
-  if (syncing || sending) {
-    notify('Wait for the current sync or send to finish before returning home.');
+  if (syncing || sending || conversationActionBusy) {
+    notify('Wait for the current sync, send, or conversation action to finish before returning home.');
     return;
   }
   if (!realMode) demoState = state;
@@ -290,8 +320,8 @@ function providerFolders() {
       </div>`;
     }).join('');
   }
-  const virtualFolders = realMode ? (folders.length ? ['outbox'] : ['inbox', 'sent', 'archive', 'outbox'])
-    : ['inbox', 'sent', 'starred', 'archive'];
+  const virtualFolders = realMode ? (folders.length ? accounts.find((entry) => entry.id === account)?.provider === 'gmail' ? ['archive', 'outbox'] : ['outbox'] : ['inbox', 'sent', 'archive', 'outbox'])
+    : ['inbox', 'sent', 'starred', 'archive', 'trash'];
   return `<details class="provider-folders" ${providerFoldersOpen ? 'open' : ''}><summary>Folders${realMode ? ' &amp; labels' : ''}</summary>
     ${account ? `<div class="provider-folder-list">
       ${realMode ? folderTree(account) : ''}
@@ -429,6 +459,11 @@ function reader() {
   const target = realMode ? replyTarget(messages, from.email) : null;
   const replyDisabled = realMode && (!target || !canSend(from.id) || realBusy || sending);
   const draftOnly = realMode && first.isDraft;
+  const senders = unknownSenders(state, first.id);
+  const canChangeConversation = !realMode || canManageMail(from.id);
+  const canAddSender = !realMode || canManageContacts(from.id);
+  const busy = realBusy || sending || syncing || conversationActionBusy;
+  const unconfirmed = messages.some((message) => message.sendState || message.isDraft);
   let previousDay = '';
   const bubbles = matchingMessages.map((message) => {
     const day = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'long', day: 'numeric' }).format(new Date(message.date));
@@ -456,7 +491,14 @@ function reader() {
       </div>
       <h2 class="subject-heading" title="${escape(topicSubject(first.subject) || '(No subject)')}">${escape(topicSubject(first.subject) || '(No subject)')}</h2>
       ${participants.length > 1 ? `<p class="chat-addresses">Participants: ${participants.map(escape).join(', ')}</p>` : ''}
-      ${!contact && received && !realMode ? `<div class="unknown-callout"><span>This sender isn't in your contacts yet.</span><button data-action="add-sender">${icon('plus')} Add contact</button></div>` : ''}
+      <div class="conversation-actions" role="group" aria-label="Conversation actions">
+        ${senders.length ? `<button class="text-button" data-action="add-conversation-sender" ${busy || !canAddSender ? 'disabled' : ''}>${icon('people')} Add sender to contacts</button>` : ''}
+        <button class="text-button" data-action="archive-conversation" ${busy || !canChangeConversation || realMode && unconfirmed ? 'disabled' : ''}>${icon('archive')} Archive</button>
+        <button class="text-button trash-action" data-action="trash-conversation" ${busy || !canChangeConversation || realMode && unconfirmed ? 'disabled' : ''}>${icon('unknown')} Move to Trash</button>
+      </div>
+      ${realMode && (!canChangeConversation || senders.length && !canAddSender)
+        ? '<p class="action-help">Reconnect in <button class="text-button" data-action="connections">Accounts</button> to allow mail actions and adding contacts.</p>' : ''}
+      ${realMode && unconfirmed ? '<p class="action-help">Sync or resolve local send attempts before moving the conversation. Provider drafts are not managed here.</p>' : ''}
     </header>
     <div class="chat-timeline" tabindex="0" aria-label="Conversation history, oldest first">
       ${matchingMessages.length ? `<ol class="chat-messages">${bubbles}</ol>` : '<div class="empty-state conversation-no-results"><h3>No matching messages</h3><p>Try another search or clear it to see the full conversation.</p></div>'}
@@ -481,11 +523,32 @@ function contactsPage() {
   </section>`;
 }
 
+function renderMailbox(markup) {
+  const template = document.createElement('template');
+  template.innerHTML = markup;
+  const previous = [...app.children];
+  const next = [...template.content.children];
+  next.forEach((region, index) => {
+    const current = previous[index];
+    if (region.matches('.sidebar') && current?.matches('.sidebar')) {
+      [...region.children].forEach((child, childIndex) => {
+        const existing = current.children[childIndex];
+        // Replacing or detaching a select closes its native account picker.
+        if (child.matches('.sidebar-select') && existing.isEqualNode(child)) return;
+        existing.replaceWith(child);
+      });
+    } else if (current) current.replaceWith(region);
+    else app.append(region);
+  });
+  previous.slice(next.length).forEach(region => region.remove());
+}
+
 function render() {
   const existingFolderTree = document.querySelector('.provider-folders');
   if (existingFolderTree) providerFoldersOpen = existingFolderTree.open;
   disposeHtmlMessages();
   if (homeVisible) {
+    pendingReads.clear();
     app.dataset.stage = 'home';
     app.innerHTML = homeScreen();
     return;
@@ -513,16 +576,16 @@ function render() {
   selected = eligible.find((conversation) => conversation.key === selectedKey)?.id || null;
   const messages = unreadOnly ? eligible.filter((conversation) => conversation.unread) : eligible;
   app.dataset.stage = folder === 'contacts' ? 'contacts' : selected ? 'reader' : folderChosen ? 'list' : 'folders';
-  app.innerHTML = `${brandRow()}
+  renderMailbox(`${brandRow()}
     <header class="topbar"><button class="compose-button desktop-compose" data-action="compose">${icon('plus')} New message</button><div class="search-wrap">${icon('search')}<input id="search" type="search" placeholder="${folder === 'contacts' ? 'Find your people...' : 'Search your conversations...'}" value="${escape(query)}" aria-label="${folder === 'contacts' ? 'Search contacts' : 'Search messages'}"><span class="search-key">/</span></div>
-      <div class="sync-area"><button class="sync-button" data-action="sync" ${syncing || realBusy ? 'disabled' : ''}>${icon('sync', syncing || realBusy ? 'spinning' : '')} ${realMode ? sending ? 'Sending...' : realBusy ? 'Syncing...' : 'Sync mail' : syncing ? 'Syncing demo...' : 'Sync demo'}</button><span>${state.lastSync ? `Last ${realMode ? 'sync' : 'demo sync'} ${dateLabel(state.lastSync)} ${time(state.lastSync)}` : realMode ? 'Connect your accounts' : 'Sample mail & contacts'}</span></div>
+      <div class="sync-area"><button class="sync-button" data-action="sync" ${syncing || realBusy ? 'disabled' : ''}>${icon('sync', syncing || realBusy ? 'spinning' : '')} ${realMode ? conversationActionBusy ? 'Updating...' : sending ? 'Sending...' : realBusy ? 'Syncing...' : 'Sync mail' : syncing ? 'Syncing demo...' : 'Sync demo'}</button><span>${state.lastSync ? `Last ${realMode ? 'sync' : 'demo sync'} ${dateLabel(state.lastSync)} ${time(state.lastSync)}` : realMode ? 'Connect your accounts' : 'Sample mail & contacts'}</span></div>
     </header>
     ${sidebar()}<main class="main">
     ${storageError && !realMode ? `<div class="storage-error" role="alert">${escape(storageError)}</div>` : ''}
-    <div class="real-status ${realMode && realError ? 'storage-error' : ''} ${realMode && realBusy ? 'sync-active' : ''}" role="${realMode && realError ? 'alert' : 'status'}">${escape(realMode ? realStatus || (accounts.length ? 'Cached mail is available offline. Reconnect to sync or send.' : 'No real accounts connected yet. Use Accounts to connect Gmail or Outlook.') : 'Sample mail and contacts. Connect your accounts to use real email.')} <button class="text-button" data-action="connections">Accounts</button>${realMode && realBusy && !sending ? '<button class="text-button" data-action="cancel-real-sync">Cancel</button>' : ''}</div>
+    <div class="real-status ${realMode && realError ? 'storage-error' : ''} ${realMode && realBusy ? 'sync-active' : ''}" role="${realMode && realError ? 'alert' : 'status'}">${escape(realMode ? realStatus || (accounts.length ? 'Cached mail is available offline. Reconnect to sync or send.' : 'No real accounts connected yet. Use Accounts to connect Gmail or Outlook.') : 'Sample mail and contacts. Connect your accounts to use real email.')} <button class="text-button" data-action="connections">Accounts</button>${realMode && realBusy && !sending && !conversationActionBusy ? '<button class="text-button" data-action="cancel-real-sync">Cancel</button>' : ''}</div>
     ${folder === 'contacts' ? `<button class="text-button folders-back" data-action="show-folders">${icon('back')} Folders</button>${contactsPage()}` : `${senderTabs()}<div id="conversation-results" role="tabpanel" aria-labelledby="sender-tab-${audience}" class="mail-workspace ${selected ? 'has-selection' : ''}">${messageList(messages)}${reader()}</div>`}
     <footer class="app-footer"><span><span class="status-dot"></span> Your inbox, a little more human.</span><span>${realMode ? 'Real mail · Local cache · Sending enabled with consent' : 'Sample data only. No email is sent. <button data-action="reset">Reset demo</button>'}</span></footer>
-  </main>`;
+  </main>`);
   document.querySelector('.provider-folders')?.addEventListener('toggle', (event) => {
     if (event.target.isConnected) providerFoldersOpen = event.target.open;
   });
@@ -549,6 +612,7 @@ function render() {
     input.focus({ preventScroll: true });
     input.setSelectionRange(scopedCursor, scopedCursor);
   }
+  if (pendingReads.size) queueMicrotask(markOpenedConversationsRead);
 }
 
 function openComposer(to = '', subject = '', accountId = account === 'all' ? accounts[0]?.id : account) {
@@ -619,6 +683,49 @@ function openContact(name = '', email = '', id = null) {
   populateContactForm(contact, name, contact?.emails || [email]);
   contactDialog.showModal();
 }
+
+function openSenderContact(messageId) {
+  const candidates = unknownSenders(state, messageId);
+  if (!candidates.length) { notify('All received senders in this conversation are already contacts.'); return; }
+  if (!realMode) { openContact(candidates[0].name, candidates[0].email); return; }
+  const message = state.messages.find((entry) => entry.id === messageId);
+  senderContext = { messageId, accountId: message.accountId, real: realMode, candidates };
+  senderForm.reset();
+  senderForm.querySelector('.form-error').textContent = '';
+  senderForm.elements.sender.innerHTML = candidates.map((sender) =>
+    `<option value="${escape(sender.email)}">${escape(sender.name)} &lt;${escape(sender.email)}&gt;</option>`).join('');
+  senderForm.elements.name.value = candidates[0].name;
+  document.querySelector('#sender-destination').textContent =
+    `Create this contact in ${accounts.find((entry) => entry.id === message.accountId).email}. The provider's existing contacts will be checked first.`;
+  senderDialog.showModal();
+}
+
+senderForm.elements.sender.addEventListener('change', () => {
+  senderForm.elements.name.value = senderContext.candidates.find((sender) => sender.email === senderForm.elements.sender.value).name;
+});
+senderForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (conversationActionBusy || realBusy || sending || !senderContext) return;
+  const context = senderContext;
+  const email = senderForm.elements.sender.value;
+  const name = senderForm.elements.name.value.trim();
+  if (!name) { senderForm.querySelector('.form-error').textContent = 'Enter a contact name.'; return; }
+  conversationActionBusy = true;
+  [...senderForm.elements].forEach((element) => { element.disabled = true; });
+  try {
+    const result = await connections.actOnConversation(context.accountId, context.messageId, 'contact', { email, name });
+    notify(result.warning || 'Sender added to provider contacts.');
+    if (senderDialog.open && realMode === context.real && account === context.accountId && !homeVisible) {
+      audience = 'contacts'; selected = context.messageId;
+    }
+    senderDialog.close();
+  } catch (error) { senderForm.querySelector('.form-error').textContent = error.message; }
+  finally {
+    conversationActionBusy = false;
+    [...senderForm.elements].forEach((element) => { element.disabled = false; });
+    render();
+  }
+});
 
 document.querySelector('#contact-target').addEventListener('change', (event) => {
   const contact = state.contacts.find((entry) => entry.id === event.target.value);
@@ -764,6 +871,9 @@ app.addEventListener('click', async (event) => {
     if (!realMode) {
       conversationMessages(state, selected).forEach((message) => { message.unread = false; });
       persist();
+    } else {
+      const message = state.messages.find(entry => entry.id === selected);
+      if (message) pendingReads.set(conversationKey(message), { accountId: message.accountId, messageId: message.id });
     }
   } else if (button.dataset.write) {
     openComposer(button.dataset.write);
@@ -796,12 +906,43 @@ app.addEventListener('click', async (event) => {
         } catch (error) { notify(error.message); }
         return;
       case 'new-contact': openContact(); return;
+      case 'add-conversation-sender':
+        if (realBusy || sending || conversationActionBusy || !message) return;
+        openSenderContact(message.id);
+        return;
+      case 'archive-conversation':
+      case 'trash-conversation': {
+        if (realBusy || sending || syncing || conversationActionBusy || !message) return;
+        const action = button.dataset.action === 'trash-conversation' ? 'trash' : 'archive';
+        const providerName = accounts.find((entry) => entry.id === message.accountId)?.name || 'the provider';
+        const scope = realMode ? `This updates the full conversation at ${providerName}, including messages outside the current search or cached date range.`
+          : 'This affects every message in this demo conversation, not just search matches.';
+        const detail = action === 'trash' ? 'Messages, including sent mail, will move to Trash / Deleted Items. Nothing will be permanently deleted.'
+          : 'Received mail will be archived. Sent mail, drafts, spam, and deleted mail are kept in their current locations.';
+        if (!confirm(`${action === 'trash' ? 'Move this conversation to Trash?' : 'Archive this conversation?'}\n\n${scope}\n\n${detail}`)) return;
+        conversationActionBusy = true;
+        render();
+        try {
+          if (realMode) {
+            const result = await connections.actOnConversation(message.accountId, message.id, action);
+            notify(result.warning || (action === 'trash' ? 'Conversation moved to Trash / Deleted Items.' : 'Conversation archived.'));
+          } else {
+            state = updateDemoConversation(state, message.id, action);
+            persist();
+            notify(action === 'trash' ? 'Demo conversation moved to Trash.' : 'Demo conversation archived.');
+          }
+        } catch (error) {
+          if (realMode) { realStatus = error.message; realError = true; }
+          notify(error.message);
+        } finally { conversationActionBusy = false; render(); }
+        return;
+      }
       case 'add-sender': {
         const received = conversationMessages(state, selected).find((entry) => entry.folder !== 'sent');
         openContact(received.senderName, received.sender);
         return;
       }
-      case 'about': notify(realMode ? 'Mail is cached on this device. Sending requires your explicit permission; existing mail and contacts are not edited. No Gather backend is used.' : 'Demo accounts are fictional samples. Use Real mail to connect your own accounts.'); return;
+      case 'about': notify(realMode ? 'Mail is cached on this device. Opening a conversation marks it read when authorized. Sending and moving conversations require your confirmation. No Gather backend is used.' : 'Demo accounts are fictional samples. Use Real mail to connect your own accounts.'); return;
       case 'conversation-format': {
         if (!message) return;
         const key = conversationKey(message);
@@ -920,6 +1061,7 @@ contactForm.addEventListener('submit', (event) => {
     return;
   }
   persist();
+  if (senderToAdd) audience = 'contacts';
   contactDialog.close();
   notify(editingContactId ? 'Contact updated. Inbox groups now reflect their email addresses.' : 'Contact added. Their inbox messages are now grouped with your people.');
   render();

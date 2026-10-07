@@ -139,7 +139,8 @@ hidden in the mobile list/reader, but active progress, cancellation, and errors
 remain visible.
 
 The first account is selected after choosing a mailbox on the welcome screen.
-The account dropdown replaces the previous all-accounts list; switching account
+The account dropdown stays open during background mailbox updates. It replaces
+the previous all-accounts list; switching account
 or choosing a mailbox from the welcome screen resets to that
 account's Inbox and Contacts tab. In mobile navigation, select a folder to open
 its list. If no real accounts exist, use the Accounts link to connect one.
@@ -240,8 +241,9 @@ its list. If no real accounts exist, use the Accounts link to connect one.
 
 **Demo mode never connects or sends email.** All sample identities and message
 content are fictional. Real mode is separate and requires explicit account
-authorization. Real sending is available after granting sending permission;
-editing/deleting existing provider messages and contacts remains disabled.
+authorization. Real sending and conversation actions require their respective
+provider permissions. Existing contact editing, message-content editing, and
+permanent deletion are not implemented.
 
 ## Checks
 
@@ -272,6 +274,12 @@ reply-header, uncertain-outcome, duplicate-prevention, and reconciliation checks
 UI checks also exercise explicit send confirmation, accepted replies appearing
 in place, rejected/uncertain sends, double-submit prevention, and new messages.
 All sending checks use mock responses: no real email is sent by tests.
+
+Open http://localhost:5173/action-tests.html for conversation archive/Trash,
+provider-contact creation, permission gating, endpoint restrictions, partial
+failure reporting, and duplicate prevention checks. UI tests also exercise the
+action buttons, contact dialog, confirmations, and resulting folder changes.
+These tests use mock APIs and never modify real provider data.
 
 Actual OAuth consent and authenticated provider API access require your own
 registered client IDs and accounts. Mock checks do not verify a registration,
@@ -314,8 +322,11 @@ instead of overwriting its cache. **Connect another account** adds a new one.
    `http://localhost:5173`. Add your HTTPS origin separately for deployment.
    Google's browser token model does not use our Microsoft redirect page.
 5. Add the scopes `https://www.googleapis.com/auth/gmail.readonly`,
-   `https://www.googleapis.com/auth/contacts.readonly`, and
-   `https://www.googleapis.com/auth/gmail.send`. Paste only the client ID,
+   `https://www.googleapis.com/auth/contacts.readonly`,
+   `https://www.googleapis.com/auth/gmail.send`,
+   `https://www.googleapis.com/auth/gmail.modify`, and
+   `https://www.googleapis.com/auth/contacts`. The latter two enable conversation
+   archive/Trash and adding senders to Google Contacts. Paste only the client ID,
    ending in `.apps.googleusercontent.com`, into Gather.
 
 The browser receives a short-lived access token, not a Google refresh token.
@@ -366,7 +377,9 @@ service fails; a contacts failure is not silently treated as a successful sync.
    exact redirect URI shown in Gather, e.g.
    `http://localhost:5173/oauth-redirect.html`. Add the deployed HTTPS URI separately.
 3. Add delegated Microsoft Graph permissions **User.Read**, **Mail.Read**,
-   **Contacts.Read**, and **Mail.Send**. Your organization may require administrator consent.
+   **Contacts.Read**, **Mail.Send**, **Mail.ReadWrite**, and **Contacts.ReadWrite**.
+   The write permissions enable conversation moves and adding senders to contacts.
+   Your organization may require administrator consent.
    Do not enable implicit grant or create/use a client secret.
 4. Paste the Application (client) ID (a UUID) into Gather.
 
@@ -403,7 +416,9 @@ folders remain selectable. Search and unread filters apply within the selected
 folder. **Sync mail** refreshes all folders for the account selected in the dropdown;
 select another account to sync it manually. Automatic background sync still
 refreshes authorized accounts while Real mail is open.
-No per-folder write permissions are requested, and no provider folders are created.
+Folder discovery and sync do not create provider folders. Mail modification
+permission is used to mark opened conversations read and for explicitly
+confirmed archive/Trash actions.
 
 Folder catalogs are rediscovered each sync. Renames keep their stable folder IDs,
 new folders are imported, and deleted folders and their cached membership/cursors
@@ -459,10 +474,65 @@ from more than one view. Unknown senders is a virtual view, not a provider folde
 Imported contacts with overlapping addresses are merged in the display without
 modifying either provider's address book.
 
-Reading and syncing remain non-mutating: opening a message does not mark it read,
-and star, archive, delete, and contact-edit controls remain absent. Make these
-changes in Google/Microsoft and sync to see them here. Demo sending remains
-demo-only and never uses a real account.
+Opening a conversation automatically marks its messages as read at the provider
+when mail-modification permission is granted. Gmail removes the thread's UNREAD
+label; Outlook updates unread, non-draft messages in the full provider conversation,
+including history outside the cache or current search. Confirmed changes are saved
+locally, and the conversation remains open even with the Unread filter enabled.
+Opening another conversation while sync or a read update is running queues its
+read update. Missing permission or a failed update leaves unconfirmed messages
+unread and shows reconnect or retry guidance; reopening retries a failed update.
+Sync itself does not change provider mail. Starring, marking unread, and editing
+existing contacts remain provider-only.
+Conversation archive/Trash and adding new senders to contacts are available as
+explicit actions after permission is granted. Demo actions remain local-only.
+
+### Conversation actions
+
+The conversation header includes **Add sender to contacts**, **Archive**, and
+**Move to Trash** on desktop and mobile. These act on the conversation, not just
+messages matching the conversation search. Gmail/Outlook connections made before
+these permissions were added must **Reconnect** and grant `gmail.modify` /
+`contacts` or `Mail.ReadWrite` / `Contacts.ReadWrite`. Missing grants are explained
+beside disabled controls with a link to Accounts; reading/sending can continue
+with their existing grants.
+
+- **Add sender to contacts** lists distinct unknown incoming senders in the
+  conversation, excluding your own outgoing messages and already-known contacts.
+  Choose the sender and edit the display name. The contact is created in the
+  conversation's originating account, not every connected account. The provider's
+  current contacts are checked first to avoid duplicates, and the returned contact
+  is cached immediately so the conversation appears under the Contacts tab.
+- **Archive** removes Gmail's Inbox label from the full provider thread. For
+  Outlook, Gather finds every message with the provider conversation ID (including
+  messages older than the cached range) and moves received messages to Archive.
+  Sent mail, drafts, Outbox, junk/spam, and deleted mail are left in place.
+  Gmail has a virtual Archive entry in its folder tree for messages no longer
+  labeled Inbox/Sent/Drafts/Spam/Trash.
+- **Move to Trash** trashes the full Gmail thread or moves Outlook conversation
+  messages to Deleted Items, including sent messages and provider history outside
+  the cached range. This is explicitly described in the confirmation. It never
+  calls permanent-delete endpoints. Restore from Trash/Deleted Items in the
+  provider and sync to bring messages back.
+
+Unconfirmed local sends and provider draft views must be synced/resolved before
+conversation moves are enabled. Contact creation and conversation actions share
+the same per-account lock as sending/sync to prevent overlapping changes from
+multiple Gather tabs on the same origin. Mutating requests are not automatically
+retried. Outlook moves are sequential and not atomic: a failure reports how many
+messages moved, applies confirmed changes to the cache, and attempts a refresh.
+Provider success followed by refresh/storage failure is shown as a warning, not
+silently reported as fully synchronized.
+
+Contact creation records a local pending marker before making the provider call.
+An uncertain outcome blocks another create until sync sees the contact. After
+checking provider contacts, the account panel's **Clear unconfirmed contact
+attempt** can remove that marker; retrying without checking could create a duplicate.
+No provider contact is deleted by that recovery control.
+
+Demo conversation actions follow the same UI: adding contacts is local, archive
+preserves sent messages, and Move to Trash moves all conversation messages to a
+local Trash folder without deleting their content.
 
 ### Sending real email
 
@@ -578,8 +648,9 @@ not to resend; its persisted pre-send attempt prevents an automatic duplicate.
   email; it does not save image files to disk. Large Gmail bodies stored as attachment objects
   receive an explicit placeholder rather than being silently shown as complete.
   Encoded display-name headers are not fully decoded.
-- Sync/image requests are GET-only. Sending uses one explicit POST to the
-  provider's send/reply endpoint after confirmation. Requests omit cookies,
+- Sync/image requests are GET-only. Sending, conversation, and contact
+  actions use POSTs restricted to their provider endpoints. Outlook read-on-open
+  uses PATCH restricted to message endpoints and the `isRead: true` update. Requests omit cookies,
   reject redirects, and restrict bearer tokens to Google/Microsoft API origins. Third-party fonts
   and analytics are not loaded. Google's SDK loads only after preparation;
   Microsoft's SDK is served locally.
@@ -592,8 +663,8 @@ not to resend; its persisted pre-send attempt prevents an automatic duplicate.
 This is an initial local-first integration, not a production security
 certification. Public distribution needs provider approval where applicable,
 privacy disclosures, and a deployment/security review. There is no hosted
-background worker, cross-device data sync, attachment uploads, or editing of
-existing provider messages/contacts.
+background worker, cross-device data sync, attachment uploads, message-body
+editing, existing-contact editing, or permanent deletion.
 
 ### SDK provenance and implementation
 
@@ -613,6 +684,7 @@ Identity Services script to load from `https://accounts.google.com/gsi/client`.
 - `email-images.js`: image URL/raster validation and on-demand provider CID-image retrieval.
 - `email-text.js`: whitespace cleanup, structured HTML-to-text conversion, and display previews.
 - `email-send.js`: outgoing validation, MIME encoding, send transport, and local-send reconciliation.
+- `conversation-actions.js`: provider contact creation, full-thread archive/Trash, and demo equivalents.
 - `accounts-panel.js`: connection, reconnect, sync, and removal UI.
 - `mail.js` / `app.js`: shared views and separate real/demo modes.
 

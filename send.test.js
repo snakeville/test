@@ -227,7 +227,7 @@ await test('Read-only Google consent permits sync but blocks sends until sending
     account = await authorize();
     assert(!canSend(account.id) && typeof getAccountApi(account) === 'function');
     await rejects(() => sendingToken(account), 'sending permission');
-    assert(requestedScopes.includes('gmail.send') && !requestedScopes.includes('gmail.modify'));
+    assert(requestedScopes.includes('gmail.send') && requestedScopes.includes('gmail.modify'));
     grantSend = true;
     account = await authorize();
     assert(canSend(account.id) && await sendingToken(account)() === 'test-token');

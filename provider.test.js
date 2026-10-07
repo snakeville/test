@@ -700,7 +700,7 @@ await test('Google authorization handles permissions, popup errors, wrong-accoun
     const connect = await prepareSignIn('gmail', gmailAccount.clientId);
     const account = await connect();
     assert(hasSession(account.id) && config.include_granted_scopes === false);
-    assert(config.scope.includes('gmail.readonly') && !config.scope.includes('gmail.modify'));
+    assert(config.scope.includes('gmail.readonly') && config.scope.includes('gmail.modify') && config.scope.includes('https://www.googleapis.com/auth/contacts'));
     await forgetSession(account.id);
     assert(!hasSession(account.id));
     await rejects(() => getAccountApi(account), 'Reconnect');
@@ -735,7 +735,7 @@ await test('Microsoft auth uses PKCE SDK with memory-only caches and explicit se
     const account = await connect();
     assert(configuration.cache.cacheLocation === 'memoryStorage' && configuration.cache.temporaryCacheLocation === 'memoryStorage');
     assert(configuration.auth.redirectUri === new URL('./oauth-redirect.html', document.baseURI).href);
-    assert(scopes.join(',') === 'User.Read,Mail.Read,Contacts.Read,Mail.Send');
+    assert(scopes.join(',') === 'User.Read,Mail.Read,Contacts.Read,Mail.Send,Mail.ReadWrite,Contacts.ReadWrite');
     await forgetSession(account.id);
     assert(cleared && !hasSession(account.id));
   } finally { window.msal = originalMsal; window.fetch = originalFetch; }

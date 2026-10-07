@@ -11,6 +11,8 @@ export function isValidSnapshot(snapshot) {
     && text(account.id) && account.id.startsWith(`${account.provider}:`) && isEmail(account.email) && text(account.clientId)
     && date(snapshot.lastSync) && date(snapshot.since) && [7, 30, 90, 365].includes(snapshot.days)
     && snapshot.cursors && Object.values(snapshot.cursors).every(text)
+    && (snapshot.pendingContact === undefined || (snapshot.pendingContact && isEmail(snapshot.pendingContact.email)
+      && text(snapshot.pendingContact.name)))
     && (snapshot.folderFormat === undefined || snapshot.folderFormat === 1)
     && (snapshot.folders === undefined || (Array.isArray(snapshot.folders)
       && snapshot.folders.every((folder) => folder && text(folder.id) && text(folder.remoteId)

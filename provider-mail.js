@@ -257,12 +257,43 @@ export function graphMessage(raw, account, folder, since, folderId = raw.parentF
   };
 }
 
-function importedContact(id, name, emails, account) {
+export function importedContact(id, name, emails, account) {
   const normalized = [...new Set(emails.filter(isEmail).map(normalizeEmail))];
   if (!normalized.length) return null;
   return { id: `${account.id}:${id}`, name: name || normalized[0], emails: normalized,
     source: account.provider, accountId: account.id, color: account.provider === 'gmail' ? 'sage' : 'blue',
     note: `Imported from ${PROVIDERS[account.provider].name}. Read-only.` };
+}
+
+export async function importContacts(account, api, signal, progress = () => {}) {
+  const contacts = [];
+  if (account.provider === 'gmail') {
+    let pageToken = '';
+    const seen = new Set();
+    do {
+      signal?.throwIfAborted();
+      if (seen.has(pageToken)) throw new ProviderError('Google repeated a contacts page. Sync stopped.');
+      seen.add(pageToken);
+      const page = await api(`${PEOPLE}?personFields=names,emailAddresses&pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`);
+      if (!page || (page.connections !== undefined && !Array.isArray(page.connections))) throw new ProviderError('Google returned an invalid contacts list. No contacts were replaced.');
+      for (const person of page.connections || []) {
+        const contact = importedContact(person.resourceName, person.names?.[0]?.displayName,
+          (person.emailAddresses || []).map((entry) => entry.value), account);
+        if (contact) contacts.push(contact);
+      }
+      pageToken = page.nextPageToken || '';
+      progress(`Gmail: imported ${contacts.length} contacts`);
+    } while (pageToken);
+  } else {
+    await pages(api, `${GRAPH}/me/contacts?$select=id,displayName,emailAddresses&$top=100`, 'value', (items) => {
+      for (const item of items) {
+        const contact = importedContact(item.id, item.displayName, (item.emailAddresses || []).map((entry) => entry.address), account);
+        if (contact) contacts.push(contact);
+      }
+      progress(`Outlook: imported ${contacts.length} contacts`);
+    }, signal);
+  }
+  return contacts;
 }
 
 export function combineSnapshots(snapshots) {
@@ -383,7 +414,6 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
   const since = previous?.days === days ? previous.since : new Date(Date.now() - days * DAY).toISOString();
   const current = await identifyAccount(account.provider, api, account.clientId);
   if (current.id !== account.id) throw new ProviderError('A different account was authorized. Reconnect the correct account; the cache has not changed.');
-  const contacts = [];
   progress('Discovering all provider folders and labels...');
   const folders = await discoverFolders(account, api, signal);
   let messages;
@@ -447,20 +477,6 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
     }
     const folderIds = new Set(folders.map((folder) => folder.id));
     for (const message of messages.values()) message.folderIds = message.folderIds.filter((id) => folderIds.has(id));
-    let pageToken = '';
-    const seen = new Set();
-    do {
-      if (seen.has(pageToken)) throw new ProviderError('Google repeated a contacts page. Sync stopped.');
-      seen.add(pageToken);
-      const page = await api(`${PEOPLE}?personFields=names,emailAddresses&pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`);
-      for (const person of page.connections || []) {
-        const contact = importedContact(person.resourceName, person.names?.[0]?.displayName,
-          (person.emailAddresses || []).map((entry) => entry.value), account);
-        if (contact) contacts.push(contact);
-      }
-      pageToken = page.nextPageToken || '';
-      progress(`Gmail: imported ${contacts.length} contacts`);
-    } while (pageToken);
   } else {
     messages = new Map();
     const fields = 'id,parentFolderId,conversationId,subject,body,from,sender,toRecipients,ccRecipients,replyTo,internetMessageHeaders,receivedDateTime,sentDateTime,createdDateTime,lastModifiedDateTime,isRead,isDraft,flag,internetMessageId';
@@ -541,14 +557,8 @@ export async function importMailbox({ account, api, previous = null, days = 30, 
         messages.set(id, { ...latest, folderIds: [...new Set([...(existing?.folderIds || []), currentFolder.id])] });
       }
     }
-    await pages(api, `${GRAPH}/me/contacts?$select=id,displayName,emailAddresses&$top=100`, 'value', (items) => {
-      for (const item of items) {
-        const contact = importedContact(item.id, item.displayName, (item.emailAddresses || []).map((entry) => entry.address), account);
-        if (contact) contacts.push(contact);
-      }
-      progress(`Outlook: imported ${contacts.length} contacts`);
-    }, signal);
   }
+  const contacts = await importContacts(account, api, signal, progress);
   signal?.throwIfAborted();
   return { account, messages: [...messages.values()], contacts, folders, cursors, days, since,
     lastSync: new Date().toISOString(), version: 1, bodyFormat: BODY_FORMAT, folderFormat: FOLDER_FORMAT };

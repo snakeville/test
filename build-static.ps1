@@ -4,6 +4,7 @@ $files = @(
     'index.html', 'oauth-redirect.html', 'oauth-redirect.js', 'styles.css',
     'app.js', 'mail.js', 'auth.js', 'accounts-panel.js', 'mailbox-store.js', 'provider-mail.js',
     'email-html.js', 'email-images.js', 'email-styles.js', 'email-text.js', 'email-quotes.js', 'email-send.js',
+    'conversation-actions.js',
     'staticwebapp.config.json',
     'vendor\msal-browser\lib\msal-browser.min.js',
     'vendor\msal-browser\lib\redirect-bridge\msal-redirect-bridge.js',

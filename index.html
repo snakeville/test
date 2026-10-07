@@ -44,14 +44,24 @@
         </div>
       </form>
     </dialog>
+    <dialog id="sender-dialog" aria-labelledby="sender-title">
+      <form id="sender-form">
+        <div class="dialog-heading"><h2 id="sender-title">Add sender to contacts</h2><button type="button" data-close aria-label="Close sender form">×</button></div>
+        <p class="muted" id="sender-destination"></p>
+        <label>Sender<select name="sender" required></select></label>
+        <label>Name<input name="name" maxlength="100" required></label>
+        <p class="form-error" role="alert"></p>
+        <button class="primary" type="submit">Add to contacts</button>
+      </form>
+    </dialog>
     <dialog id="accounts-dialog" aria-labelledby="accounts-title">
       <div class="dialog-heading"><h2 id="accounts-title">Connect real email</h2><button type="button" id="close-accounts" aria-label="Close account setup">×</button></div>
-      <p class="muted">Connect directly to Google or Microsoft to read mail, import contacts, and send email with your permission. Existing messages and contacts are not edited. Data is cached in this browser's IndexedDB, never on a Gather server. Tokens remain in this tab's memory. Do not connect on a shared device.</p>
-      <p class="muted">Conversations open as plain text. Switching to HTML asks whether to display images; you can decline and load them individually later. HTML is sanitized and isolated. Remote image hosts may learn your IP address and that you opened the email. Scripts, forms, and other attachment downloads remain blocked. Links require confirmation. Closing the app stops sync.</p>
+      <p class="muted">Connect directly to Google or Microsoft to read and send mail, add senders to contacts, and archive or move conversations to Trash with your permission. Nothing is permanently deleted. Data is cached in this browser's IndexedDB, never on a Gather server. Tokens remain in this tab's memory. Do not connect on a shared device.</p>
+      <p class="muted">Opening a conversation marks it read at the provider when mail-modification permission is granted. Conversations open as plain text. Switching to HTML asks whether to display images; you can decline and load them individually later. HTML is sanitized and isolated. Remote image hosts may learn your IP address and that you opened the email. Scripts, forms, and other attachment downloads remain blocked. Links require confirmation. Closing the app stops sync.</p>
       <details class="setup-help">
         <summary>OAuth setup requirements</summary>
         <p>Register a Google Web application client, enable <a href="https://console.cloud.google.com/apis/library/gmail.googleapis.com" target="_blank" rel="noopener noreferrer">Gmail API</a> and <a href="https://console.cloud.google.com/apis/library/people.googleapis.com" target="_blank" rel="noopener noreferrer">People API</a> in the same Google Cloud project that owns that client ID, and add your account as an OAuth test user. Granting OAuth permissions does not enable these APIs. Authorized JavaScript origin: <code id="google-origin"></code></p>
-        <p>Register a Microsoft application allowing personal Microsoft accounts (and organizational accounts if needed). Add a <strong>Single-page application</strong> redirect: <code id="microsoft-redirect"></code>. Grant delegated User.Read, Mail.Read, Contacts.Read, and Mail.Send permissions. Google requires gmail.readonly, contacts.readonly, and gmail.send. Existing accounts must reconnect to grant sending permission. Do not create or enter a client secret.</p>
+        <p>Register a Microsoft application allowing personal Microsoft accounts (and organizational accounts if needed). Add a <strong>Single-page application</strong> redirect: <code id="microsoft-redirect"></code>. Grant delegated User.Read, Mail.Read, Contacts.Read, Mail.Send, Mail.ReadWrite, and Contacts.ReadWrite permissions. Google requests gmail.readonly, contacts.readonly, gmail.send, gmail.modify, and contacts. Existing accounts must reconnect to grant conversation-action permissions. Do not create or enter a client secret.</p>
         <p>Use an HTTPS static host for deployment. If sign-in is blocked in the preview panel, open the same URL in your regular browser. All provider mail folders and Gmail labels are imported, including drafts, junk/spam, and deleted/trash. Mail import starts from the chosen date range; subsequent syncs catch up from that starting date.</p>
       </details>
       <section id="connected-accounts" aria-label="Connected accounts"></section>

@@ -1,8 +1,9 @@
 import { openMailboxStore, isValidSnapshot } from './mailbox-store.js';
 import { importMailbox, combineSnapshots, PROVIDERS } from './provider-mail.js';
-import { prepareSignIn, getAccountApi, forgetSession, hasSession, canSend, sendingToken, validateClientId } from './auth.js';
+import { prepareSignIn, getAccountApi, forgetSession, hasSession, canSend, canManageMail, canManageContacts, mutationToken, sendingToken, validateClientId } from './auth.js';
 import { prepareOutgoing, submitOutgoing, acceptedOutgoing, mergeLocalSends } from './email-send.js';
-import { conversationMessages } from './mail.js';
+import { conversationMessages, findContact, isOutgoing, normalizeEmail } from './mail.js';
+import { createActionRequest, changeProviderConversation, addProviderSender } from './conversation-actions.js';
 
 const SETTINGS_KEY = 'gather-oauth-public-client-ids-v1';
 const escape = (value) => String(value).replace(/[&<>"']/g, (character) =>
@@ -49,7 +50,10 @@ export function createAccountsPanel({ onChange, onStatus }) {
 
   function renderAccounts() {
     list.innerHTML = snapshots.length ? snapshots.map((snapshot) => `<article class="connected-account">
-      <div><strong>${escape(snapshot.account.email)}</strong><span>${PROVIDERS[snapshot.account.provider].name} · ${hasSession(snapshot.account.id) ? canSend(snapshot.account.id) ? 'Sync and sending authorized' : 'Read-only · Reconnect to enable sending' : 'Reconnect to sync or send'}</span>
+      <div><strong>${escape(snapshot.account.email)}</strong><span>${PROVIDERS[snapshot.account.provider].name} · ${hasSession(snapshot.account.id) ? canSend(snapshot.account.id) ? 'Sync and sending authorized' : 'Sync authorized · Reconnect to enable sending' : 'Reconnect to sync or send'}</span>
+      <span>Mail actions: ${canManageMail(snapshot.account.id) ? 'authorized' : 'reconnect required'} · Add contacts: ${canManageContacts(snapshot.account.id) ? 'authorized' : 'reconnect required'}</span>
+      ${snapshot.pendingContact ? `<span>Contact creation unconfirmed. Check provider contacts and sync before retrying.</span>
+      <button type="button" class="text-button" data-clear-contact-attempt="${escape(snapshot.account.id)}" ${busy ? 'disabled' : ''}>Clear unconfirmed contact attempt</button>` : ''}
       <small>${snapshot.messages.length} messages · ${snapshot.contacts.length} contacts · ${snapshot.folders?.length || 0} folders/labels<br>Mail since ${escape(new Date(snapshot.since).toLocaleDateString())}<br>Last synced ${escape(new Date(snapshot.lastSync).toLocaleString())}</small></div>
       <div class="connection-actions"><button type="button" class="text-button" data-reconnect="${escape(snapshot.account.id)}" ${busy ? 'disabled' : ''}>Reconnect</button>
       <button type="button" class="text-button" data-remove-account="${escape(snapshot.account.id)}" ${busy ? 'disabled' : ''}>Remove local data</button></div>
@@ -116,13 +120,14 @@ export function createAccountsPanel({ onChange, onStatus }) {
 
   async function saveImported(account, days) {
     const run = async () => {
-      const previous = snapshots.find((snapshot) => snapshot.account.id === account.id);
+      const previous = (await store.list()).find((snapshot) => snapshot.account.id === account.id);
       const snapshot = await importMailbox({
         account, previous, days, api: getAccountApi(account, controller.signal, (message) => status(message)),
         signal: controller.signal, progress: (message) => status(message),
       });
       controller.signal.throwIfAborted();
       mergeLocalSends(snapshot, previous);
+      if (previous?.pendingContact && !findContact(snapshot.contacts, previous.pendingContact.email)) snapshot.pendingContact = previous.pendingContact;
       await store.save(snapshot);
       snapshots = [...snapshots.filter((entry) => entry.account.id !== account.id), snapshot];
       publish();
@@ -163,9 +168,31 @@ export function createAccountsPanel({ onChange, onStatus }) {
   list.addEventListener('click', async (event) => {
     const button = event.target.closest('button');
     if (!button || busy) return;
-    const snapshot = snapshots.find((entry) => entry.account.id === (button.dataset.reconnect || button.dataset.removeAccount));
+    const snapshot = snapshots.find((entry) => entry.account.id === (button.dataset.reconnect || button.dataset.removeAccount || button.dataset.clearContactAttempt));
     if (!snapshot) return;
     if (button.dataset.reconnect) { configure(snapshot); return; }
+    if (button.dataset.clearContactAttempt) {
+      if (!confirm('Have you checked provider contacts and synced? Clear this local unconfirmed attempt only if the contact was not created. Retrying could otherwise create a duplicate. No provider contact will be deleted.')) return;
+      setBusy(true);
+      try {
+        const clear = async () => {
+          const latest = (await store.list()).find((entry) => entry.account.id === snapshot.account.id);
+          if (!latest) throw new Error('This account no longer exists in the cache.');
+          delete latest.pendingContact;
+          await store.save(latest);
+          snapshots = snapshots.map((entry) => entry.account.id === latest.account.id ? latest : entry);
+          publish();
+          status('Local contact attempt cleared. No provider contact was changed.');
+        };
+        if (!navigator.locks) await clear();
+        else await navigator.locks.request(`gather-mail-sync:${snapshot.account.id}`, { ifAvailable: true }, async (lock) => {
+          if (!lock) throw new Error('This account is busy in another Gather tab.');
+          await clear();
+        });
+      } catch (error) { status(error.message, true); }
+      finally { setBusy(false); }
+      return;
+    }
     if (!confirm(`Remove locally cached messages and contacts for ${snapshot.account.email}? Close other Gather tabs first so they cannot sync this data back. This will not change provider mail or revoke its consent.`)) return;
     setBusy(true);
     try {
@@ -304,8 +331,123 @@ export function createAccountsPanel({ onChange, onStatus }) {
     } finally { setBusy(false); }
   }
 
+  async function actOnConversation(accountId, messageId, action, values = {}) {
+    if (busy) throw new Error('Wait for the current sync, send, or conversation action to finish.');
+    if (!['contact', 'archive', 'trash', 'read'].includes(action)) throw new Error('Unsupported conversation action.');
+    setBusy(true);
+    try {
+      if (!store) store = await openMailboxStore();
+      const run = async () => {
+        snapshots = await store.list();
+        let snapshot = snapshots.find((entry) => entry.account.id === accountId);
+        if (!snapshot || !isValidSnapshot(snapshot)) throw new Error('Connect and sync this account before changing it.');
+        const api = getAccountApi(snapshot.account, undefined, (message) => status(message));
+        const request = createActionRequest(mutationToken(snapshot.account, action === 'contact' ? 'contact' : 'mail'), snapshot.account.provider);
+        const publishSnapshot = () => {
+          snapshots = snapshots.map((entry) => entry.account.id === accountId ? snapshot : entry);
+          publish();
+        };
+        const saveAndPublish = async () => {
+          await store.save(snapshot);
+          publishSnapshot();
+        };
+        if (action === 'contact') {
+          const source = conversationMessages(snapshot, messageId).find((message) => !isOutgoing(message)
+            && normalizeEmail(message.sender) === normalizeEmail(values.email || ''));
+          if (!source) throw new Error('Choose a sender from this conversation.');
+          status('Checking provider contacts before adding the sender...');
+          let creationStarted = false;
+          try {
+            const result = await addProviderSender(snapshot, source.sender, values.name, api, request, async (email) => {
+              snapshot = { ...snapshot, pendingContact: { email, name: values.name.trim() } };
+              await saveAndPublish();
+              creationStarted = true;
+              status('Adding sender to provider contacts...');
+            });
+            snapshot = { ...snapshot, contacts: result.contacts };
+            if (snapshot.pendingContact?.email === result.contact.emails[0]) delete snapshot.pendingContact;
+            try { await saveAndPublish(); }
+            catch {
+              publishSnapshot();
+              const warning = 'The contact exists at the provider, but its local cache could not be saved. Sync before adding it again.';
+              status(warning, true);
+              return { warning, contact: result.contact };
+            }
+            status(result.existing ? 'Sender is already in provider contacts. Local contacts refreshed.' : 'Sender added to provider contacts.');
+            return { contact: result.contact, warning: '' };
+          } catch (error) {
+            // A known rejection is safe to retry. Preserve uncertain creation markers across reloads.
+            let persistenceWarning = '';
+            if (creationStarted && !error.uncertain && snapshot.pendingContact?.email === source.sender) {
+              snapshot = { ...snapshot };
+              delete snapshot.pendingContact;
+              try { await saveAndPublish(); } catch {
+                publishSnapshot();
+                persistenceWarning = ' The local action status could not be saved. Check provider contacts and sync before retrying.';
+              }
+            }
+            status(error.message + persistenceWarning, true);
+            throw new Error(error.message + persistenceWarning);
+          }
+        }
+        let result, failure;
+        status(action === 'read' ? 'Marking conversation as read...' : action === 'trash' ? 'Moving conversation to Trash / Deleted Items...' : 'Archiving conversation...');
+        try { result = await changeProviderConversation(snapshot, messageId, action, api, request, (message) => status(message)); }
+        catch (error) { failure = error; result = { updates: error.updates || [], destination: error.destination }; }
+        let saveWarning = '';
+        if (result.updates?.length) {
+          const updates = new Map(result.updates.map((message) => [message.previousId || message.id, message]));
+          const folders = [...(snapshot.folders || [])];
+          if (result.destination && !folders.some((folder) => folder.id === result.destination.id)) folders.push(result.destination);
+          snapshot = { ...snapshot, folders, messages: snapshot.messages.map((message) => {
+            const updated = updates.get(message.id);
+            if (!updated) return message;
+            const { previousId, ...clean } = updated;
+            return clean;
+          }) };
+          try { await saveAndPublish(); } catch { publishSnapshot(); saveWarning = ' Confirmed changes could not be saved locally.'; }
+        }
+        if (action === 'read') {
+          if (failure) {
+            const message = failure.message + saveWarning;
+            status(message, true);
+            throw new Error(message);
+          }
+          const summary = 'Conversation marked as read.' + saveWarning;
+          status(summary, Boolean(saveWarning));
+          return { warning: saveWarning ? summary + ' Sync again to refresh the cache.' : '', changed: result.changed };
+        }
+        status('Refreshing the mailbox after the conversation action...');
+        let refreshError = '';
+        try {
+          const fresh = await importMailbox({ account: snapshot.account, previous: snapshot, days: snapshot.days, api,
+            progress: (message) => status(message) });
+          mergeLocalSends(fresh, snapshot);
+          if (snapshot.pendingContact && !findContact(fresh.contacts, snapshot.pendingContact.email)) fresh.pendingContact = snapshot.pendingContact;
+          snapshot = fresh;
+          await saveAndPublish();
+          saveWarning = '';
+        } catch (error) { refreshError = `${saveWarning} Refresh failed: ${error.message} The cache may be incomplete; sync again.`; }
+        if (failure) {
+          const message = failure.message + refreshError;
+          status(message, true);
+          throw new Error(message);
+        }
+        const summary = result.changed ? action === 'trash' ? 'Conversation moved to Trash / Deleted Items. Nothing was permanently deleted.' : 'Conversation archived.'
+          : 'No messages needed to be moved.';
+        status(summary + refreshError, Boolean(refreshError));
+        return { warning: refreshError ? summary + refreshError : '', changed: result.changed };
+      };
+      if (!navigator.locks) return await run();
+      return await navigator.locks.request(`gather-mail-sync:${accountId}`, { ifAvailable: true }, async (lock) => {
+        if (!lock) throw new Error('This account is busy in another Gather tab. Wait before changing the conversation.');
+        return run();
+      });
+    } finally { setBusy(false); }
+  }
+
   return {
-    show, initialize, sync, send, removeSendAttempt, isBusy: () => busy,
+    show, initialize, sync, send, removeSendAttempt, actOnConversation, isBusy: () => busy,
     cancel,
     async syncWhenDue() {
       if (busy || document.hidden || Date.now() - lastAutomaticAttempt < 5 * 60000) return;

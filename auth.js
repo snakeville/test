@@ -3,6 +3,8 @@ import { createApi, identifyAccount, ProviderError } from './provider-mail.js';
 const GOOGLE_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/contacts.readonly'];
 const MICROSOFT_SCOPES = ['User.Read', 'Mail.Read', 'Contacts.Read'];
 const GOOGLE_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
+const GOOGLE_MAIL_WRITE = 'https://www.googleapis.com/auth/gmail.modify';
+const GOOGLE_CONTACT_WRITE = 'https://www.googleapis.com/auth/contacts';
 const sessions = new Map();
 const libraries = new Map();
 
@@ -53,6 +55,23 @@ export function canSend(accountId) {
   return hasSession(accountId) && sessions.get(accountId).canSend === true;
 }
 
+export function canManageMail(accountId) {
+  return hasSession(accountId) && sessions.get(accountId).canManageMail === true;
+}
+
+export function canManageContacts(accountId) {
+  return hasSession(accountId) && sessions.get(accountId).canManageContacts === true;
+}
+
+export function mutationToken(account, action) {
+  const permitted = action === 'contact' ? canManageContacts : canManageMail;
+  if (!permitted(account.id)) throw new ProviderError(`Reconnect this account and grant ${action === 'contact' ? 'contacts editing' : 'mail modification'} permission.`);
+  return () => {
+    if (!permitted(account.id)) throw new ProviderError('Authorization expired. Reconnect before changing provider data.');
+    return sessions.get(account.id).getToken(action);
+  };
+}
+
 export function sendingToken(account) {
   if (!canSend(account.id)) throw new ProviderError('Reconnect this account and grant sending permission before sending real email.');
   return () => {
@@ -75,7 +94,7 @@ export async function prepareSignIn(provider, inputId) {
     await loadScript('https://accounts.google.com/gsi/client', () => Boolean(window.google?.accounts?.oauth2));
     authorize = () => new Promise((resolve, reject) => {
       const client = google.accounts.oauth2.initTokenClient({
-        client_id: clientId, scope: [...GOOGLE_SCOPES, GOOGLE_SEND_SCOPE].join(' '),
+        client_id: clientId, scope: [...GOOGLE_SCOPES, GOOGLE_SEND_SCOPE, GOOGLE_MAIL_WRITE, GOOGLE_CONTACT_WRITE].join(' '),
         include_granted_scopes: false,
         callback: (response) => {
           if (response.error) { reject(new Error(`Google authorization failed (${response.error}).`)); return; }
@@ -88,7 +107,11 @@ export async function prepareSignIn(provider, inputId) {
             return;
           }
           const expires = Date.now() + Number(response.expires_in) * 1000 - 60000;
-          resolve({ canSend: google.accounts.oauth2.hasGrantedAllScopes(response, GOOGLE_SEND_SCOPE), expiresAt: expires, getToken: async () => {
+          resolve({
+            canSend: google.accounts.oauth2.hasGrantedAllScopes(response, GOOGLE_SEND_SCOPE),
+            canManageMail: google.accounts.oauth2.hasGrantedAllScopes(response, GOOGLE_MAIL_WRITE),
+            canManageContacts: google.accounts.oauth2.hasGrantedAllScopes(response, GOOGLE_CONTACT_WRITE),
+            expiresAt: expires, getToken: async () => {
             if (Date.now() >= expires) throw new ProviderError('Gmail authorization expired. Reconnect Gmail to continue syncing.');
             return response.access_token;
           } });
@@ -110,11 +133,14 @@ export async function prepareSignIn(provider, inputId) {
       system: { loggerOptions: { piiLoggingEnabled: false, loggerCallback: () => {} } },
     });
     await instance.initialize();
-    authorize = () => instance.acquireTokenPopup({ scopes: [...MICROSOFT_SCOPES, 'Mail.Send'], prompt: 'select_account' }).then((result) => ({
+    authorize = () => instance.acquireTokenPopup({ scopes: [...MICROSOFT_SCOPES, 'Mail.Send', 'Mail.ReadWrite', 'Contacts.ReadWrite'], prompt: 'select_account' }).then((result) => ({
       canSend: result.scopes?.some((scope) => scope.toLowerCase().replace('https://graph.microsoft.com/', '') === 'mail.send') === true,
-      getToken: async (forSending = false) => {
+      canManageMail: result.scopes?.some((scope) => scope.toLowerCase().replace('https://graph.microsoft.com/', '') === 'mail.readwrite') === true,
+      canManageContacts: result.scopes?.some((scope) => scope.toLowerCase().replace('https://graph.microsoft.com/', '') === 'contacts.readwrite') === true,
+      getToken: async (purpose = false) => {
         try {
-          const token = await instance.acquireTokenSilent({ scopes: forSending ? [...MICROSOFT_SCOPES, 'Mail.Send'] : MICROSOFT_SCOPES, account: result.account });
+          const extra = purpose === 'contact' ? ['Contacts.ReadWrite'] : purpose === 'mail' ? ['Mail.ReadWrite'] : purpose ? ['Mail.Send'] : [];
+          const token = await instance.acquireTokenSilent({ scopes: [...MICROSOFT_SCOPES, ...extra], account: result.account });
           return token.accessToken;
         } catch (error) {
           if (error instanceof msal.InteractionRequiredAuthError) throw new ProviderError('Microsoft needs authorization again. Reconnect this account.');
