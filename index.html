@@ -66,10 +66,13 @@
       </details>
       <section id="connected-accounts" aria-label="Connected accounts"></section>
       <button type="button" class="text-button" id="new-provider-account">Connect another account</button>
+      <p class="muted">Add multiple Gmail and Outlook accounts. Choose a different account in the provider's sign-in window. Only one public application ID is needed per provider; each mailbox has its own authorization and cached mail.</p>
       <form id="connection-form">
         <p class="muted" id="connection-target"></p>
         <label>Provider<select name="provider"><option value="gmail">Gmail / Google</option><option value="outlook">Outlook.com / Microsoft</option></select></label>
-        <label>Public application client ID<input name="clientId" autocomplete="off" spellcheck="false" required placeholder="Not a password or client secret"></label>
+        <label>Public application client ID<input name="clientId" autocomplete="off" spellcheck="false" required placeholder="Not a password or client secret" aria-describedby="provider-client-help"></label>
+        <p class="muted" id="provider-client-help"></p>
+        <button type="button" class="text-button" id="edit-provider-client" hidden>Change application ID for this provider</button>
         <label>Initial mail history<select name="days"><option value="7">Past 7 days</option><option value="30" selected>Past 30 days</option><option value="90">Past 90 days</option><option value="365">Past year</option></select></label>
         <button id="prepare-provider" class="primary" type="submit">Prepare sign-in</button>
         <button id="connect-provider" class="primary" type="button" hidden>Connect and import</button>

@@ -1,6 +1,6 @@
 import { createApi, ProviderError, plainTextFromHtml, gmailMessage, graphMessage, importMailbox, combineSnapshots, discoverFolders } from './provider-mail.js';
 import { openMailboxStore, isValidSnapshot } from './mailbox-store.js';
-import { validateClientId, prepareSignIn, hasSession, forgetSession, getAccountApi } from './auth.js';
+import { validateClientId, prepareSignIn, hasSession, forgetSession, getAccountApi, sendingToken, mutationToken } from './auth.js';
 import { conversationMessages, visibleMessages, visibleConversations, replyToConversation, providerFolderId, conversationAddress, isOutgoing } from './mail.js';
 
 const results = [];
@@ -739,6 +739,83 @@ await test('Microsoft auth uses PKCE SDK with memory-only caches and explicit se
     await forgetSession(account.id);
     assert(cleared && !hasSession(account.id));
   } finally { window.msal = originalMsal; window.fetch = originalFetch; }
+});
+
+await test('Multiple accounts share provider client IDs but isolate tokens, reconnects, and removal', async () => {
+  const originalGoogle = window.google, originalMsal = window.msal, originalFetch = window.fetch;
+  let chosen = 'first';
+  const accounts = [], clientIds = [], cleared = [];
+  window.google = { accounts: { oauth2: {
+    hasGrantedAllScopes: () => true,
+    initTokenClient: options => {
+      clientIds.push(options.client_id);
+      return { requestAccessToken: request => {
+        assert(request.prompt === 'select_account');
+        options.callback({ access_token: `gmail-${chosen}`, expires_in: 3600 });
+      } };
+    },
+  } } };
+  window.msal = {
+    PublicClientApplication: class {
+      constructor(config) { clientIds.push(config.auth.clientId); this.cachedAccounts = new Set(); }
+      async initialize() {}
+      async acquireTokenPopup(request) {
+        assert(request.prompt === 'select_account');
+        this.cachedAccounts.add(chosen);
+        return { account: { homeAccountId: chosen }, scopes: request.scopes };
+      }
+      async acquireTokenSilent(request) {
+        assert(this.cachedAccounts.has(request.account.homeAccountId), 'The account token cache was cleared');
+        return { accessToken: `outlook-${request.account.homeAccountId}` };
+      }
+      async clearCache(request) {
+        this.cachedAccounts.delete(request.account.homeAccountId);
+        cleared.push(request.account.homeAccountId);
+      }
+    },
+    InteractionRequiredAuthError: class extends Error {},
+  };
+  window.fetch = async (url, options) => {
+    const token = options.headers.Authorization.replace('Bearer ', '');
+    return new Response(JSON.stringify(url.includes('/profile')
+      ? { emailAddress: `${token}@example.com` }
+      : { id: token, mail: `${token}@example.com` }));
+  };
+  try {
+    for (const provider of ['gmail', 'outlook']) {
+      const clientId = provider === 'gmail' ? gmailAccount.clientId : graphAccount.clientId;
+      const connect = await prepareSignIn(provider, clientId);
+      chosen = 'first';
+      const first = await connect();
+      accounts.push(first);
+      chosen = 'second';
+      const second = await connect();
+      accounts.push(second);
+      assert(first.id !== second.id && first.clientId === second.clientId);
+      for (const [account, suffix] of [[first, 'first'], [second, 'second']]) {
+        assert(await sendingToken(account)() === `${provider}-${suffix}`);
+        assert(await mutationToken(account, 'mail')() === `${provider}-${suffix}`);
+        const profile = await getAccountApi(account)(provider === 'gmail'
+          ? 'https://gmail.googleapis.com/gmail/v1/users/me/profile' : 'https://graph.microsoft.com/v1.0/me');
+        assert((profile.emailAddress || profile.mail) === `${provider}-${suffix}@example.com`);
+      }
+      // Wrong-account sign-in must not remove an already-authorized second account.
+      const reconnect = await prepareSignIn(provider, clientId);
+      await rejects(() => reconnect(undefined, first.id), 'different account');
+      assert(await sendingToken(second)() === `${provider}-second` && hasSession(first.id));
+      chosen = 'first';
+      assert((await reconnect(undefined, first.id)).id === first.id);
+      await forgetSession(first.id);
+      assert(!hasSession(first.id) && hasSession(second.id));
+      assert(await sendingToken(second)() === `${provider}-second`);
+    }
+    assert(clientIds.filter(id => id === gmailAccount.clientId).length === 4);
+    assert(clientIds.filter(id => id === graphAccount.clientId).length === 2);
+    assert(cleared.includes('first'));
+  } finally {
+    for (const account of accounts) await forgetSession(account.id);
+    window.google = originalGoogle; window.msal = originalMsal; window.fetch = originalFetch;
+  }
 });
 
 for (const result of results) {

@@ -290,15 +290,18 @@ try {
   const conversationChanges = new Map();
   let actionCalls = 0, rejectAction = false, uncertainContact = false, writeGrants = false;
   let readCalls = 0, rejectRead = false;
+  let googleToken = 'ui-test-token';
+  const googleClientIds = [];
   const readThreads = new Set();
   let sendScenario = 'success', sendCalls = 0, releaseSend;
   const decodeMime = value => new TextDecoder().decode(Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), character => character.charCodeAt(0)));
   windowInFrame.google = { accounts: { oauth2: {
     hasGrantedAllScopes: (_response, ...scopes) => !partialConsent
       && (writeGrants || scopes.every(scope => !scope.endsWith('/gmail.modify') && !scope.endsWith('/contacts'))),
-    initTokenClient: (options) => ({ requestAccessToken: () => options.callback({
-      access_token: 'ui-test-token', expires_in: 3600,
-    }) }),
+    initTokenClient: (options) => {
+      googleClientIds.push(options.client_id);
+      return { requestAccessToken: () => options.callback({ access_token: googleToken, expires_in: 3600 }) };
+    },
   } } };
   const originalFetch = windowInFrame.fetch.bind(windowInFrame);
   windowInFrame.fetch = async (input, options = {}) => {
@@ -929,6 +932,164 @@ try {
   windowInFrame.confirm = sendConfirm;
   click('[data-action="connections"]');
   await waitFor(() => documentInFrame.querySelector('[data-remove-account]') && !documentInFrame.querySelector('[data-remove-account]').disabled);
+  const primaryFetch = windowInFrame.fetch;
+  const multiRequests = [];
+  const microsoftClientIds = [], clearedMicrosoft = [];
+  let microsoftUser = 'outlook-one';
+  windowInFrame.msal = {
+    PublicClientApplication: class {
+      constructor(configuration) { microsoftClientIds.push(configuration.auth.clientId); }
+      async initialize() {}
+      async acquireTokenPopup(request) {
+        return { account: { homeAccountId: microsoftUser }, scopes: request.scopes };
+      }
+      async acquireTokenSilent(request) { return { accessToken: request.account.homeAccountId }; }
+      async clearCache(request) { clearedMicrosoft.push(request.account.homeAccountId); }
+    },
+    InteractionRequiredAuthError: class extends Error {},
+  };
+  windowInFrame.fetch = async (input, options = {}) => {
+    const url = new URL(String(input), location.href);
+    const token = options.headers?.Authorization?.replace('Bearer ', '');
+    if (!['gmail-two', 'outlook-one', 'outlook-two'].includes(token)) return primaryFetch(input, options);
+    multiRequests.push({ token, path: url.pathname });
+    const json = value => new Response(JSON.stringify(value));
+    const email = `${token}@example.com`;
+    if (url.pathname.endsWith('/profile')) return json({ emailAddress: email, historyId: '200' });
+    if (url.pathname.endsWith('/labels')) return json({ labels: [{ id: 'INBOX', name: 'INBOX', type: 'system' }] });
+    if (url.pathname.includes('/connections')) return json({ connections: [] });
+    if (url.pathname.endsWith('/history')) return json({ historyId: '201' });
+    if (url.pathname === '/v1.0/me') return json({ id: token, mail: email });
+    if (url.pathname.endsWith('/contacts')) return json({ value: [] });
+    if (url.pathname.endsWith('/mailFolders')) return json({ value: [
+      { id: 'inbox', displayName: 'Inbox', childFolderCount: 0 },
+    ] });
+    if (/\/mailFolders\/[^/]+$/.test(url.pathname)) return url.pathname.endsWith('/inbox')
+      ? json({ id: 'inbox' }) : new Response('{}', { status: 404 });
+    if (url.pathname.includes('/mailFolders/inbox/messages')) return json({
+      value: [{
+        id: 'same-message-id', parentFolderId: 'inbox', conversationId: 'same-thread-id',
+        from: { emailAddress: { address: 'unknown@example.com', name: 'Unknown sender' } },
+        toRecipients: [{ emailAddress: { address: email } }], subject: `Mail for ${token}`,
+        body: { contentType: 'text', content: `Private mailbox ${token}` },
+        receivedDateTime: new Date().toISOString(), isRead: true, isDraft: false,
+      }], '@odata.deltaLink': 'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?cursor=1',
+    });
+    if (url.pathname.endsWith('/messages')) return json({ messages: [{ id: 'same-message-id' }] });
+    if (url.pathname.endsWith('/messages/same-message-id')) return json({
+      id: 'same-message-id', threadId: 'same-thread-id', internalDate: String(Date.now()), labelIds: ['INBOX'],
+      payload: { mimeType: 'text/plain', headers: [
+        { name: 'From', value: 'unknown@example.com' }, { name: 'To', value: email },
+        { name: 'Subject', value: `Mail for ${token}` },
+      ], body: { data: btoa(`Private mailbox ${token}`) } },
+    });
+    throw new Error(`Unexpected multi-account request: ${url.pathname}`);
+  };
+  const connectExtra = async (provider, count) => {
+    click('#new-provider-account');
+    changeSelect('#connection-form [name="provider"]', provider);
+    click('#prepare-provider');
+    await waitFor(() => !documentInFrame.querySelector('#connect-provider').hidden);
+    click('#connect-provider');
+    await waitFor(() => documentInFrame.querySelectorAll('.connected-account').length === count
+      && !documentInFrame.querySelector('#prepare-provider').disabled);
+  };
+  assert(form.elements.clientId.readOnly && form.elements.clientId.value === '123-test.apps.googleusercontent.com',
+    'Previously saved Google application ID is reused without re-entry');
+  googleToken = 'gmail-two';
+  await connectExtra('gmail', 2);
+  assert(googleClientIds.at(-1) === '123-test.apps.googleusercontent.com',
+    'A second Gmail account uses the same application ID');
+  click('#new-provider-account');
+  changeSelect('#connection-form [name="provider"]', 'outlook');
+  assert(!form.elements.clientId.value && !form.elements.clientId.readOnly,
+    'A provider without configuration asks for its own application ID once');
+  const microsoftClientId = '11111111-2222-3333-4444-555555555555';
+  form.elements.clientId.value = microsoftClientId;
+  click('#prepare-provider');
+  await waitFor(() => !documentInFrame.querySelector('#connect-provider').hidden);
+  click('#connect-provider');
+  await waitFor(() => documentInFrame.querySelectorAll('.connected-account').length === 3
+    && !documentInFrame.querySelector('#prepare-provider').disabled);
+  microsoftUser = 'outlook-two';
+  await connectExtra('outlook', 4);
+  assert(microsoftClientIds.every(id => id === microsoftClientId),
+    'Both Outlook accounts reuse one Microsoft application ID');
+  click('#close-accounts');
+  assert(documentInFrame.querySelector('#account-select').options.length === 4,
+    'The account picker includes two Gmail and two Outlook accounts');
+  for (const [id, token] of [['gmail:gmail-two@example.com', 'gmail-two'], ['outlook:outlook-one', 'outlook-one'], ['outlook:outlook-two', 'outlook-two']]) {
+    changeSelect('#account-select', id);
+    click('[data-audience="unknown"]');
+    assert(documentInFrame.querySelectorAll('.message-card').length === 1
+      && documentInFrame.querySelector('.message-card').textContent.includes(`Mail for ${token}`),
+      `Account ${token} shows only its own mail despite identical provider message IDs`);
+    const before = multiRequests.length;
+    click('[data-action="sync"]');
+    await waitFor(() => !documentInFrame.querySelector('[data-action="sync"]').disabled);
+    assert(multiRequests.slice(before).length > 0 && multiRequests.slice(before).every(request => request.token === token),
+      `Sync uses the selected ${token} account's authorization`);
+  }
+  click('[data-action="compose"]');
+  const multiCompose = documentInFrame.querySelector('#compose-form');
+  assert(multiCompose.elements.account.options.length === 4
+    && multiCompose.elements.account.value === 'outlook:outlook-two',
+    'Compose offers every connected account and defaults to the currently selected mailbox');
+  click('#compose-form [data-close]');
+  click('[data-action="connections"]');
+  await waitFor(() => !documentInFrame.querySelector('#prepare-provider').disabled);
+  changeSelect('#connection-form [name="provider"]', 'gmail');
+  click('#edit-provider-client');
+  form.elements.clientId.value = '456-shared.apps.googleusercontent.com';
+  form.elements.clientId.dispatchEvent(new windowInFrame.Event('input', { bubbles: true }));
+  click('#prepare-provider');
+  await waitFor(() => !documentInFrame.querySelector('#connect-provider').hidden);
+  click('[data-reconnect="gmail:real-user@example.com"]');
+  assert(form.elements.clientId.value === '456-shared.apps.googleusercontent.com' && form.elements.clientId.readOnly,
+    'Reconnect uses the shared provider ID rather than the ID stored in an older account snapshot');
+  click('#prepare-provider');
+  await waitFor(() => !documentInFrame.querySelector('#connect-provider').hidden);
+  click('#connect-provider');
+  await waitFor(() => documentInFrame.querySelector('#connection-feedback').textContent.includes('different account')
+    && !documentInFrame.querySelector('#prepare-provider').disabled);
+  assert(documentInFrame.querySelectorAll('.connected-account').length === 4,
+    'Choosing the wrong account during reconnect leaves all four cached accounts intact');
+  googleToken = 'ui-test-token';
+  click('#connect-provider');
+  await waitFor(() => documentInFrame.querySelector('#connection-feedback').textContent.includes('Imported')
+    && !documentInFrame.querySelector('#prepare-provider').disabled);
+  assert(documentInFrame.querySelectorAll('.connected-account').length === 4 && googleClientIds.at(-1) === '456-shared.apps.googleusercontent.com',
+    'Reconnecting an existing account updates it without creating a duplicate');
+  click('#close-accounts');
+  click('[data-action="connections"]');
+  await waitFor(() => !documentInFrame.querySelector('#prepare-provider').disabled);
+  assert(form.elements.clientId.value === '456-shared.apps.googleusercontent.com',
+    'Shared application IDs persist when account setup is reopened');
+  windowInFrame.localStorage.setItem('gather-oauth-public-client-ids-v1', JSON.stringify({ outlook: microsoftClientId }));
+  click('#close-accounts');
+  click('[data-action="connections"]');
+  await waitFor(() => !documentInFrame.querySelector('#prepare-provider').disabled);
+  assert(['123-test.apps.googleusercontent.com', '456-shared.apps.googleusercontent.com'].includes(form.elements.clientId.value)
+    && form.elements.clientId.readOnly
+    && JSON.parse(windowInFrame.localStorage.getItem('gather-oauth-public-client-ids-v1')).gmail === form.elements.clientId.value,
+    'Existing account metadata restores a missing shared provider ID without requiring re-entry');
+  changeSelect('#connection-form [name="provider"]', 'outlook');
+  assert(form.elements.clientId.value === microsoftClientId,
+    'Changing the Google application ID does not replace the Microsoft application ID');
+  windowInFrame.confirm = () => true;
+  for (const id of ['gmail:gmail-two@example.com', 'outlook:outlook-one', 'outlook:outlook-two']) {
+    click(`[data-remove-account="${id}"]`);
+    await waitFor(() => !documentInFrame.querySelector(`[data-remove-account="${id}"]`)
+      && !documentInFrame.querySelector('#prepare-provider').disabled);
+  }
+  assert(clearedMicrosoft.join(',') === 'outlook-one,outlook-two'
+    && documentInFrame.querySelectorAll('.connected-account').length === 1,
+    'Removing added accounts clears only their own Microsoft authorization and local snapshots');
+  changeSelect('#connection-form [name="provider"]', 'outlook');
+  assert(form.elements.clientId.value === microsoftClientId,
+    'Removing the last account preserves the provider application ID for future accounts');
+  changeSelect('#connection-form [name="provider"]', 'gmail');
+  windowInFrame.fetch = primaryFetch;
   const confirmOriginal = windowInFrame.confirm;
   windowInFrame.confirm = () => true;
   click('[data-remove-account]');

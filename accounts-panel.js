@@ -14,6 +14,8 @@ export function createAccountsPanel({ onChange, onStatus }) {
   const form = document.querySelector('#connection-form');
   const providerField = form.elements.provider;
   const clientField = form.elements.clientId;
+  const editClientButton = document.querySelector('#edit-provider-client');
+  const clientHelp = document.querySelector('#provider-client-help');
   const daysField = form.elements.days;
   const prepareButton = document.querySelector('#prepare-provider');
   const connectButton = document.querySelector('#connect-provider');
@@ -84,9 +86,14 @@ export function createAccountsPanel({ onChange, onStatus }) {
     providerField.disabled = false;
     if (snapshot) {
       providerField.value = snapshot.account.provider;
-      clientField.value = snapshot.account.clientId;
       daysField.value = String(snapshot.days);
-    } else clientField.value = settings[providerField.value] || '';
+    }
+    clientField.value = settings[providerField.value] || '';
+    clientField.readOnly = Boolean(clientField.value);
+    editClientButton.hidden = !clientField.readOnly;
+    clientHelp.textContent = clientField.readOnly
+      ? `Saved ${PROVIDERS[providerField.value].name} application ID. Reused for every account of this type, including reconnects.`
+      : `Enter the public ${PROVIDERS[providerField.value].name} application ID once. It will be reused for all accounts of this type.`;
     document.querySelector('#connection-target').textContent = snapshot
       ? `Reconnect ${snapshot.account.email}. Choose this same account in the sign-in window.`
       : 'Connect a new account. You can connect more than one account from each provider.';
@@ -94,6 +101,14 @@ export function createAccountsPanel({ onChange, onStatus }) {
   }
 
   providerField.addEventListener('change', () => { configure(); });
+  editClientButton.addEventListener('click', () => {
+    if (busy) return;
+    clientField.readOnly = false;
+    editClientButton.hidden = true;
+    clientHelp.textContent = 'The new application ID will be used for all future connections and reconnects of this provider. Existing mailboxes and active sessions are kept.';
+    resetPrepared();
+    clientField.focus();
+  });
   clientField.addEventListener('input', resetPrepared);
   daysField.addEventListener('change', resetPrepared);
 
@@ -105,8 +120,12 @@ export function createAccountsPanel({ onChange, onStatus }) {
       setBusy(true);
       status('Preparing sign-in. No mailbox data is requested until you press Connect.');
       authorize = await prepareSignIn(providerField.value, clientId);
-      settings = { ...settings, [providerField.value]: clientId };
-      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+      const updatedSettings = { ...settings, [providerField.value]: clientId };
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(updatedSettings));
+      settings = updatedSettings;
+      clientField.readOnly = true;
+      editClientButton.hidden = false;
+      clientHelp.textContent = `Saved ${PROVIDERS[providerField.value].name} application ID. Reused for every account of this type, including reconnects.`;
       prepareButton.hidden = true;
       connectButton.hidden = false;
       status('Ready. Press Connect and import to open the provider sign-in window.');
@@ -214,8 +233,13 @@ export function createAccountsPanel({ onChange, onStatus }) {
     setBusy(true);
     try {
       const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-      settings = stored && typeof stored === 'object' ? stored : {};
+      settings = {};
       await initialize();
+      for (const provider of Object.keys(PROVIDERS)) {
+        const clientId = stored?.[provider] || snapshots.find(snapshot => snapshot.account.provider === provider)?.account.clientId;
+        if (clientId) settings[provider] = validateClientId(provider, clientId);
+      }
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
       configure();
     } catch (error) { status(`Unable to load account setup: ${error.message}`, true); }
     finally { setBusy(false); }

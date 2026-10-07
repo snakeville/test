@@ -289,9 +289,9 @@ organizational consent policy, or a live mailbox.
 
 ### Connect an account
 
-1. Click **Connect Gmail or Outlook** (or **Real mail → Manage accounts**).
-2. Select the provider, enter its **public client ID**, and choose the initial
-   mail range: 7, 30, 90, or 365 days.
+1. Choose **Real mail** on the welcome screen, then open **Accounts**.
+2. Select the provider, enter its **public client ID** if it has not been saved
+   yet, and choose the initial mail range: 7, 30, 90, or 365 days.
 3. Click **Prepare sign-in**, then **Connect and import**. Preparation loads the
    provider SDK but does not read your mailbox. The separate Connect click
    preserves the browser gesture needed to open the sign-in popup.
@@ -308,6 +308,31 @@ organizational consent policy, or a live mailbox.
 You can connect multiple accounts from either provider. **Reconnect** requires
 choosing the same account; an accidental different-account sign-in is rejected
 instead of overwriting its cache. **Connect another account** adds a new one.
+
+### Multiple accounts and shared application IDs
+
+In **Accounts**, click **Connect another account**, choose Gmail or Outlook,
+then prepare sign-in and select the additional account in the provider's popup.
+Repeat for as many accounts of either provider as needed. Select a mailbox using
+the account dropdown; its folders and conversations are kept separate, even
+when two accounts have identical provider message or folder IDs.
+
+Gather saves **one Google client ID and one Microsoft application ID** per
+browser origin. Saved IDs are filled in automatically and reused for new
+accounts and reconnects, including accounts previously connected with an older
+ID. Use **Change application ID for this provider** to edit one, then
+**Prepare sign-in** to save it. This does not delete mailboxes or replace active
+authorizations; the new ID takes effect when each account next connects.
+If shared settings are missing, Gather recovers an ID from an existing account
+of that provider. Removing an account retains its provider's saved ID.
+
+Each mailbox has its own in-memory authorization and IndexedDB snapshot.
+Sync and sending use the selected account's authorization; removing one account
+does not sign out or delete data for the others. Reconnecting an existing account
+updates it rather than creating a duplicate. Application IDs are public
+configuration, not passwords, and never replace each account's individual consent.
+Gmail accounts must be allowed by the Google OAuth app's test-user/publishing
+configuration; the Microsoft app must permit the intended account types and tenants.
 
 ### Google registration
 
